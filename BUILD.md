@@ -7,7 +7,7 @@ This file is a **living document**. Every future agent or developer working in t
 If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
 
 Reviewed on: 2026-03-20
-Reviewed from commit: `54e8b163dc8ba011213666902e7f7ee9f6ebbe8e` plus working-tree updates applied during this pass
+Reviewed from commit: `4a498f4cee47827df538905d4267b0ee29e3d058` plus working-tree updates applied during this pass
 Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`
 
 ## 1. Project Baseline
@@ -212,6 +212,7 @@ There are no repo-provided commands for:
   - Defaults the connection target to `127.0.0.1:6669`
 - `crates/tracescope-core/src/store.rs`
   - Creates the SQLite schema lazily if missing.
+  - Persists full recorded snapshots transactionally via `save_session_snapshot`.
   - There is no migration framework yet.
 
 ## 4. Current Gaps And Known Issues
@@ -224,7 +225,7 @@ There are no repo-provided commands for:
    - Connect, record, save, reload, and delete were not driven through the GUI in this pass.
 
 2. Recording is still snapshot-based, not event-log-based.
-   - `persist_recording` saves the latest task/span/resource state at stop time.
+   - `SessionStore::save_session_snapshot` now saves the latest task/span/resource state transactionally at stop time.
    - There is no time-travel replay engine yet.
 
 ### Codebase/product gaps visible in code
@@ -247,65 +248,40 @@ There are no repo-provided commands for:
 
 Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 5/5, `cargo fmt --check` clean.
 
+Items fixed in this pass:
+
+- `normalize_target` is now owned by `tracescope-core` and reused by the app.
+- `load_session` now queries the requested session row directly instead of scanning `list_sessions()`.
+- Session payload loading now uses fixed allowlisted SQL statements instead of interpolated table/column names.
+- `timestamp_to_datetime` now validates protobuf nanoseconds with `u32::try_from`.
+- Recording persistence is now transactional across the session/tasks/spans/resources writes.
+- `CloseSpan` now cleans up `active_spans` and accounts for any final busy duration on close.
+- UI cleanup landed for session-filter empty states, warning labels, timeline span labels, and enum text rendering.
+- The demo server now drops the original `tx` sender after spawning workers.
+
 ### Severity: Medium
 
-1. **Duplicated `normalize_target` function** (`collector.rs:554`, `main.rs:69`)
-   - Identical function appears in both `tracescope-core::collector` and `tracescope-app::main`. The core version is not `pub`, so the app reimplements it. Make the core version public and reuse it, or extract it into a shared utility, to prevent drift.
-
-2. **`load_session` calls `list_sessions` to find one row** (`store.rs:246-251`)
-   - `load_session` fetches *all* sessions via `list_sessions()`, then linearly scans for the matching ID. This is an O(n) database round-trip that should be a `SELECT ... WHERE id = ?1` query. Harmless at current scale but architecturally wasteful and will degrade if session count grows.
-
-3. **`load_payloads` builds SQL via string interpolation** (`store.rs:342-343`)
-   - `format!("SELECT payload_json FROM {table} WHERE session_id = ?1 ORDER BY {id_column} ASC")` — the `table` and `id_column` values are all internal string literals so this is not exploitable today, but it bypasses parameterized query safety. If these arguments ever become caller-controlled, this becomes a SQL injection vector. Consider validating against an allowlist or using a compile-time approach.
-
-4. **`timestamp_to_datetime` casts `nanos` with `as u32`** (`collector.rs:564`)
-   - `timestamp.nanos as u32` silently truncates negative nanosecond values from malformed protobuf timestamps. Use `u32::try_from(timestamp.nanos).ok()` to match the pattern used in `duration_from_prost`, or clamp to zero.
-
-5. **New connection per store operation** (`store.rs:326-330`)
+1. **New connection per store operation** (`store.rs:274-278`)
    - Every `SessionStore` method opens a new `Connection`. SQLite `open()` is cheap for bundled mode, but this prevents using WAL mode or connection pooling effectively, and the repeated `PRAGMA foreign_keys = ON` on every call is a symptom. Consider holding a persistent connection (or using a pool) and setting pragmas once.
-
-6. **`persist_recording` is not transactional across tables** (`app.rs:297-332`)
-   - `create_session`, `save_task_batch`, `save_span_batch`, and `save_resource_batch` are four separate transactions. If any middle step fails, the session row exists with partial data. Wrapping the full persist in a single transaction would prevent orphaned sessions.
 
 ### Severity: Low
 
-7. **`CollectorState.active_spans` never cleaned up on close** (`collector.rs:361-368`)
-   - `CloseSpan` updates the span's `exited_at` but does not remove the span from `active_spans`. If a span closes without a preceding `ExitSpan`, its entry leaks in the `active_spans` HashMap for the lifetime of the collector. Low impact because the map is small, but technically a memory leak per closed-without-exit span.
+2. **`FieldValue::as_display` allocates a new `String` for every call** (`model.rs:121-128`)
+   - Returns `String` even for the `Debug` and `String` variants where a `&str` borrow would suffice. Called in the hot filter path (`query.rs:101`). Consider returning `Cow<'_, str>` or `&str` if filtering performance matters later.
 
-8. **`apply_task_update` sets name/fields unconditionally on `or_insert_with`** (`collector.rs:380-396`)
-   - After `entry.or_insert_with()`, lines 393-396 unconditionally overwrite `task.name` and `task.fields` with the same metadata. This double-write is harmless but redundant — the values were just set by `or_insert_with` on first insert, and on subsequent calls the `or_insert_with` closure doesn't run but the overwrites still do. Same pattern exists in `apply_resource_update` (lines 449-471). This is intentional (handle metadata updates) but the control flow makes it look accidental.
+3. **`query_tasks` and `query_resources` clone all matching items** (`query.rs:104`, `query.rs:145`)
+   - Every frame recomputes the filtered/sorted list by cloning all matching tasks and resources. At current data volumes this is fine. If task counts grow to thousands, consider caching the sorted result and invalidating on snapshot change.
 
-9. **Task and resource `or_insert_with` fallback names differ in style** (`collector.rs:384` vs `collector.rs:395`)
-   - The `or_insert_with` block uses `format!("task-{id:?}")` (Debug formatting, produces `task-TaskId(5)`) while the overwrite line uses `format!("task-{}", id.0)` (Display, produces `task-5`). These should be consistent — the overwrite always wins, so the `or_insert_with` format is dead code on the name field, but it's confusing.
-
-10. **Timeline bar layout doesn't respect label width** (`timeline.rs:24-33`)
-    - `ui.set_width(220.0)` attempts to reserve space for the span label, but the bar allocation and duration label come *after* within the same `horizontal` layout. If the span name exceeds 220px, the bar gets clipped or pushed. Not harmful but produces visual glitches with long span names.
-
-11. **`FieldValue::as_display` allocates a new `String` for every call** (`model.rs:121-128`)
-    - Returns `String` even for the `Debug` and `String` variants where a `&str` borrow would suffice. Called in the hot filter path (`query.rs:101`). Consider returning `Cow<'_, str>` or `&str` if filtering performance matters later.
-
-12. **`session_filter` state lives in two places** (`sessions.rs:65`, `app.rs:263-265`)
-    - The sessions view checks `app.sessions.is_empty()` but renders the list from `app.filtered_sessions()`. If the filter is active and hides all sessions, the "No saved sessions yet." message doesn't appear, making it look like something is broken. The empty-state check should use the filtered result.
-
-13. **`drop(tx)` not called before demo-server sleep loop** (`demo-server/main.rs:14-35`)
-    - After spawning `channel_consumer`, the original `tx` sender is still held by main, so the consumer will never observe channel closure. This is fine for a demo (it runs forever) but if the producer tasks are dropped, the consumer hangs instead of exiting. Dropping `tx` after spawning producers would be cleaner.
-
-14. **Warning kind rendered via `{:?}` debug format** (`warnings.rs:46`)
-    - `format!("{:?}", warning.kind)` renders as `LongPoll` and `SelfWake` (Rust Debug). A `Display` impl or explicit mapping would produce more readable output like `Long Poll` and `Self Wake`.
+4. **100ms repaint timer** (`app.rs:341`)
+   - `ctx.request_repaint_after(Duration::from_millis(100))` runs at ~10 FPS equivalent. This is reasonable for a data viewer but means the UI will not reflect new data faster than 100ms even if the collector emits faster.
 
 ### Severity: Informational (architecture notes)
 
-15. **No `Display` impl for `TaskState`, `WarningKind`, or `SpanLevel`.**
-    - These types are rendered in the UI via ad-hoc `match` expressions (`tasks.rs:93-100`) or Debug formatting. Adding `Display` impls centralizes the text representation and prevents drift between views.
+5. **Recording remains snapshot-only** (`app.rs:58-61`, `store.rs:84-100`)
+   - Recording still only tracks start time plus the final snapshot written at stop time. The transactional write fixed partial-session persistence, but it did not change the underlying snapshot-only data model.
 
-16. **`query_tasks` and `query_resources` clone all matching items** (`query.rs:104`, `query.rs:145`)
-    - Every frame recomputes the filtered/sorted list by cloning all matching tasks and resources. At current data volumes this is fine. If task counts grow to thousands, consider caching the sorted result and invalidating on snapshot change.
-
-17. **100ms repaint timer** (`app.rs:339`)
-    - `ctx.request_repaint_after(Duration::from_millis(100))` runs at ~10 FPS equivalent. This is reasonable for a data viewer but means the UI won't reflect new data faster than 100ms even if the collector emits faster.
-
-18. **`RecordingState` only tracks start time** (`app.rs:58-61`)
-    - Recording doesn't capture intermediate snapshots. If the user records for 10 minutes, only the final snapshot at stop time is persisted. This is documented in section 4 but worth flagging as the primary architectural limitation for any future replay/diff feature.
+6. **Collector and UI integration coverage is still absent.**
+   - Automated coverage remains concentrated in `tracescope-core`. The highest-risk flows still need tests around collector state transitions and session interactions.
 
 ## 6. Next-Pass Priorities
 
@@ -318,19 +294,16 @@ Full source review performed on 2026-03-20 against current working tree. Clippy 
    - Recording saves to SQLite.
    - Session load/delete works.
 
-2. Fix medium-severity code review findings (section 5).
-   - Deduplicate `normalize_target`.
-   - Replace `list_sessions` scan in `load_session` with a direct query.
-   - Wrap `persist_recording` in a single transaction.
-   - Fix the `nanos as u32` cast in `timestamp_to_datetime`.
-
-3. Add tests where current risk is highest.
+2. Add tests where current risk is highest.
    - Collector-state transformation tests.
    - UI/session-flow tests if practical.
    - If practical, a small integration test for demo-server compatibility.
 
-4. Introduce migrations before evolving `sessions.db`.
+3. Introduce migrations before evolving `sessions.db`.
    - The inline schema creation is fine for now but will get risky as persisted data becomes more important.
+
+4. Consolidate store connection management.
+   - The transactional snapshot write improved correctness, but `SessionStore` still opens a fresh SQLite connection for every operation.
 
 5. Upgrade the recording model.
    - Move from snapshot-only persistence toward an event-log or timeline-oriented session format.
@@ -340,7 +313,6 @@ Full source review performed on 2026-03-20 against current working tree. Clippy 
 - Replace snapshot-only recording with an event-log or timeline-oriented persistence model.
 - Introduce database migrations.
 - Consolidate connection management (single persistent `Connection` or pool).
-- Add `Display` impls for UI-rendered enums.
 - Build the richer timeline/comparison features currently listed only as roadmap items.
 
 ## 7. Next-Agent Checklist

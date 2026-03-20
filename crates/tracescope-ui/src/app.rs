@@ -319,16 +319,18 @@ impl TraceScopeApp {
             ),
         ]);
 
-        let session_id = store.create_session(&SessionDraft {
-            name: session_name,
-            target_address: self.snapshot.target_address.clone(),
-            started_at,
-            ended_at,
-            metadata,
-        })?;
-        store.save_task_batch(session_id, &self.snapshot.tasks)?;
-        store.save_span_batch(session_id, &self.snapshot.spans)?;
-        store.save_resource_batch(session_id, &self.snapshot.resources)?;
+        let session_id = store.save_session_snapshot(
+            &SessionDraft {
+                name: session_name,
+                target_address: self.snapshot.target_address.clone(),
+                started_at,
+                ended_at,
+                metadata,
+            },
+            &self.snapshot.tasks,
+            &self.snapshot.spans,
+            &self.snapshot.resources,
+        )?;
         Ok(session_id)
     }
 }

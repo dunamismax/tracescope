@@ -4,7 +4,9 @@ use anyhow::Context;
 use clap::Parser;
 use eframe::{egui, NativeOptions};
 use tokio_util::sync::CancellationToken;
-use tracescope_core::{Collector, CollectorCommand, CollectorEvent, ConnectionState};
+use tracescope_core::{
+    normalize_target, Collector, CollectorCommand, CollectorEvent, ConnectionState,
+};
 use tracescope_ui::{TraceScopeApp, TraceScopeAppConfig};
 use tracing_subscriber::EnvFilter;
 
@@ -64,14 +66,6 @@ fn default_data_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".tracescope")
-}
-
-fn normalize_target(input: &str) -> String {
-    if input.starts_with("http://") || input.starts_with("https://") {
-        input.to_string()
-    } else {
-        format!("http://{input}")
-    }
 }
 
 fn spawn_collector_manager(

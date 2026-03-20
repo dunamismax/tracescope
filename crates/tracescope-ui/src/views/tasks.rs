@@ -2,7 +2,7 @@
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
-use tracescope_core::{query::TaskSortColumn, TaskState};
+use tracescope_core::query::TaskSortColumn;
 
 use crate::app::TraceScopeApp;
 
@@ -53,7 +53,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
                     ui.label(&task.name);
                 });
                 row.col(|ui| {
-                    ui.label(state_label(task.state));
+                    ui.label(task.state.to_string());
                 });
                 row.col(|ui| {
                     ui.label(format!("{} ms", task.stats.total_duration.as_millis()));
@@ -88,13 +88,4 @@ fn sort_header(
             app.set_task_sort(column);
         }
     });
-}
-
-fn state_label(state: TaskState) -> &'static str {
-    match state {
-        TaskState::Running => "Running",
-        TaskState::Idle => "Idle",
-        TaskState::Scheduled => "Scheduled",
-        TaskState::Done => "Done",
-    }
 }

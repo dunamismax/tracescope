@@ -1,7 +1,7 @@
 //! gRPC collector for Tokio console telemetry.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{hash_map::Entry, BTreeMap, HashMap},
     future::pending,
     sync::mpsc::Sender,
 };
@@ -361,8 +361,14 @@ impl CollectorState {
             Some(Event::CloseSpan(close)) => {
                 if let (Some(span_id), Some(at)) = (close.span_id, timestamp_to_datetime(close.at))
                 {
-                    if let Some(span) = self.spans.get_mut(&SpanId(span_id.id)) {
+                    let span_id = SpanId(span_id.id);
+                    if let Some(span) = self.spans.get_mut(&span_id) {
                         span.exited_at.get_or_insert(at);
+                        if let Some(started_at) = self.active_spans.remove(&span_id) {
+                            span.busy_duration = span
+                                .busy_duration
+                                .saturating_add(duration_between(started_at, at));
+                        }
                     }
                 }
             }
@@ -377,23 +383,30 @@ impl CollectorState {
             };
 
             let metadata = self.metadata.get(new_task.metadata);
-            let task = self.tasks.entry(id).or_insert_with(|| Task {
-                id,
-                name: metadata
-                    .map(|value| value.name.clone())
-                    .unwrap_or_else(|| format!("task-{id:?}")),
-                state: TaskState::Idle,
-                fields: decode_fields(metadata, &new_task.fields),
-                stats: TaskStats::default(),
-                warnings: Vec::new(),
-                created_at: None,
-                dropped_at: None,
-            });
-
-            task.name = metadata
+            let name = metadata
                 .map(|value| value.name.clone())
                 .unwrap_or_else(|| format!("task-{}", id.0));
-            task.fields = decode_fields(metadata, &new_task.fields);
+            let fields = decode_fields(metadata, &new_task.fields);
+
+            match self.tasks.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Task {
+                        id,
+                        name,
+                        state: TaskState::Idle,
+                        fields,
+                        stats: TaskStats::default(),
+                        warnings: Vec::new(),
+                        created_at: None,
+                        dropped_at: None,
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    let task = entry.get_mut();
+                    task.name = name;
+                    task.fields = fields;
+                }
+            }
         }
 
         for (task_id, stats) in update.stats_update {
@@ -446,29 +459,32 @@ impl CollectorState {
             let metadata = self.metadata.get(new_resource.metadata);
             let kind =
                 decode_resource_kind(new_resource.kind.as_ref(), &new_resource.concrete_type);
-            let resource = self.resources.entry(id).or_insert_with(|| Resource {
-                id,
-                kind: kind.clone(),
-                name: metadata
-                    .map(|value| value.name.clone())
-                    .unwrap_or_else(|| new_resource.concrete_type.clone()),
-                stats: ResourceStats::default(),
-                visibility: if new_resource.is_internal {
-                    ResourceVisibility::Internal
-                } else {
-                    ResourceVisibility::Visible
-                },
-            });
-
-            resource.kind = kind;
-            resource.name = metadata
+            let name = metadata
                 .map(|value| value.name.clone())
                 .unwrap_or_else(|| new_resource.concrete_type.clone());
-            resource.visibility = if new_resource.is_internal {
+            let visibility = if new_resource.is_internal {
                 ResourceVisibility::Internal
             } else {
                 ResourceVisibility::Visible
             };
+
+            match self.resources.entry(id) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Resource {
+                        id,
+                        kind,
+                        name,
+                        stats: ResourceStats::default(),
+                        visibility,
+                    });
+                }
+                Entry::Occupied(mut entry) => {
+                    let resource = entry.get_mut();
+                    resource.kind = kind;
+                    resource.name = name;
+                    resource.visibility = visibility;
+                }
+            }
         }
 
         for (resource_id, stats) in update.stats_update {
@@ -551,7 +567,7 @@ impl CollectorState {
     }
 }
 
-fn normalize_target(input: &str) -> String {
+pub fn normalize_target(input: &str) -> String {
     if input.starts_with("http://") || input.starts_with("https://") {
         input.to_string()
     } else {
@@ -561,7 +577,8 @@ fn normalize_target(input: &str) -> String {
 
 fn timestamp_to_datetime(timestamp: Option<prost_types::Timestamp>) -> Option<DateTime<Utc>> {
     timestamp.and_then(|timestamp| {
-        DateTime::<Utc>::from_timestamp(timestamp.seconds, timestamp.nanos as u32)
+        let nanos = u32::try_from(timestamp.nanos).ok()?;
+        DateTime::<Utc>::from_timestamp(timestamp.seconds, nanos)
     })
 }
 

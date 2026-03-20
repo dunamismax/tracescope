@@ -7,7 +7,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Row};
 use thiserror::Error;
 
 use crate::model::{LoadedSession, Resource, Session, SessionId, Span, Task};
@@ -82,46 +82,34 @@ impl SessionStore {
     /// Creates a new session and returns its assigned identifier.
     pub fn create_session(&self, draft: &SessionDraft) -> Result<SessionId, StoreError> {
         let connection = self.connection()?;
-        connection.execute(
-            "INSERT INTO sessions (name, target_address, started_at, ended_at, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                draft.name,
-                draft.target_address,
-                draft.started_at.to_rfc3339(),
-                draft.ended_at.map(|value| value.to_rfc3339()),
-                serde_json::to_string(&draft.metadata)?,
-            ],
-        )?;
+        insert_session(&connection, draft)
+    }
 
-        let id =
-            u64::try_from(connection.last_insert_rowid()).map_err(|_| StoreError::IdConversion)?;
-        Ok(SessionId(id))
+    /// Persists a full recorded snapshot in a single transaction.
+    pub fn save_session_snapshot(
+        &self,
+        draft: &SessionDraft,
+        tasks: &[Task],
+        spans: &[Span],
+        resources: &[Resource],
+    ) -> Result<SessionId, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+
+        let session_id = insert_session(&transaction, draft)?;
+        replace_task_batch(&transaction, session_id, tasks)?;
+        replace_span_batch(&transaction, session_id, spans)?;
+        replace_resource_batch(&transaction, session_id, resources)?;
+
+        transaction.commit()?;
+        Ok(session_id)
     }
 
     /// Persists a full batch of tasks for a session.
     pub fn save_task_batch(&self, session_id: SessionId, tasks: &[Task]) -> Result<(), StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM tasks WHERE session_id = ?1",
-            params![as_sql_id(session_id)?],
-        )?;
-
-        for task in tasks {
-            transaction.execute(
-                "INSERT INTO tasks (session_id, task_id, name, state, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    as_sql_id(session_id)?,
-                    as_sql_u64(task.id.0)?,
-                    task.name,
-                    format!("{:?}", task.state),
-                    serde_json::to_string(task)?,
-                ],
-            )?;
-        }
-
+        replace_task_batch(&transaction, session_id, tasks)?;
         transaction.commit()?;
         Ok(())
     }
@@ -130,25 +118,7 @@ impl SessionStore {
     pub fn save_span_batch(&self, session_id: SessionId, spans: &[Span]) -> Result<(), StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM spans WHERE session_id = ?1",
-            params![as_sql_id(session_id)?],
-        )?;
-
-        for span in spans {
-            transaction.execute(
-                "INSERT INTO spans (session_id, span_id, name, target, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    as_sql_id(session_id)?,
-                    as_sql_u64(span.id.0)?,
-                    span.name,
-                    span.target,
-                    serde_json::to_string(span)?,
-                ],
-            )?;
-        }
-
+        replace_span_batch(&transaction, session_id, spans)?;
         transaction.commit()?;
         Ok(())
     }
@@ -161,25 +131,7 @@ impl SessionStore {
     ) -> Result<(), StoreError> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
-        transaction.execute(
-            "DELETE FROM resources WHERE session_id = ?1",
-            params![as_sql_id(session_id)?],
-        )?;
-
-        for resource in resources {
-            transaction.execute(
-                "INSERT INTO resources (session_id, resource_id, name, kind, payload_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    as_sql_id(session_id)?,
-                    as_sql_u64(resource.id.0)?,
-                    resource.name,
-                    resource.kind,
-                    serde_json::to_string(resource)?,
-                ],
-            )?;
-        }
-
+        replace_resource_batch(&transaction, session_id, resources)?;
         transaction.commit()?;
         Ok(())
     }
@@ -244,17 +196,13 @@ impl SessionStore {
 
     /// Loads all persisted data for a single session.
     pub fn load_session(&self, session_id: SessionId) -> Result<LoadedSession, StoreError> {
-        let session = self
-            .list_sessions()?
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .ok_or(StoreError::SessionNotFound(session_id))?;
-
         let connection = self.connection()?;
-        let tasks = load_payloads::<Task>(&connection, "tasks", "task_id", session_id)?;
-        let spans = load_payloads::<Span>(&connection, "spans", "span_id", session_id)?;
+        let session = load_session_row(&connection, session_id)?
+            .ok_or(StoreError::SessionNotFound(session_id))?;
+        let tasks = load_payloads::<Task>(&connection, PayloadTable::Tasks, session_id)?;
+        let spans = load_payloads::<Span>(&connection, PayloadTable::Spans, session_id)?;
         let resources =
-            load_payloads::<Resource>(&connection, "resources", "resource_id", session_id)?;
+            load_payloads::<Resource>(&connection, PayloadTable::Resources, session_id)?;
 
         Ok(LoadedSession {
             session,
@@ -330,18 +278,38 @@ impl SessionStore {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PayloadTable {
+    Tasks,
+    Spans,
+    Resources,
+}
+
+impl PayloadTable {
+    fn select_payload_sql(self) -> &'static str {
+        match self {
+            Self::Tasks => {
+                "SELECT payload_json FROM tasks WHERE session_id = ?1 ORDER BY task_id ASC"
+            }
+            Self::Spans => {
+                "SELECT payload_json FROM spans WHERE session_id = ?1 ORDER BY span_id ASC"
+            }
+            Self::Resources => {
+                "SELECT payload_json FROM resources WHERE session_id = ?1 ORDER BY resource_id ASC"
+            }
+        }
+    }
+}
+
 fn load_payloads<T>(
     connection: &Connection,
-    table: &str,
-    id_column: &str,
+    table: PayloadTable,
     session_id: SessionId,
 ) -> Result<Vec<T>, StoreError>
 where
     T: serde::de::DeserializeOwned,
 {
-    let query =
-        format!("SELECT payload_json FROM {table} WHERE session_id = ?1 ORDER BY {id_column} ASC");
-    let mut statement = connection.prepare(&query)?;
+    let mut statement = connection.prepare(table.select_payload_sql())?;
     let rows = statement.query_map(params![as_sql_id(session_id)?], |row| {
         let payload = row.get::<_, String>(0)?;
         serde_json::from_str::<T>(&payload).map_err(|error| {
@@ -358,6 +326,152 @@ where
         values.push(row?);
     }
     Ok(values)
+}
+
+fn insert_session(connection: &Connection, draft: &SessionDraft) -> Result<SessionId, StoreError> {
+    connection.execute(
+        "INSERT INTO sessions (name, target_address, started_at, ended_at, metadata_json)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            draft.name,
+            draft.target_address,
+            draft.started_at.to_rfc3339(),
+            draft.ended_at.map(|value| value.to_rfc3339()),
+            serde_json::to_string(&draft.metadata)?,
+        ],
+    )?;
+
+    let id = u64::try_from(connection.last_insert_rowid()).map_err(|_| StoreError::IdConversion)?;
+    Ok(SessionId(id))
+}
+
+fn replace_task_batch(
+    connection: &Connection,
+    session_id: SessionId,
+    tasks: &[Task],
+) -> Result<(), StoreError> {
+    connection.execute(
+        "DELETE FROM tasks WHERE session_id = ?1",
+        params![as_sql_id(session_id)?],
+    )?;
+
+    for task in tasks {
+        connection.execute(
+            "INSERT INTO tasks (session_id, task_id, name, state, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                as_sql_id(session_id)?,
+                as_sql_u64(task.id.0)?,
+                task.name,
+                task.state.to_string(),
+                serde_json::to_string(task)?,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn replace_span_batch(
+    connection: &Connection,
+    session_id: SessionId,
+    spans: &[Span],
+) -> Result<(), StoreError> {
+    connection.execute(
+        "DELETE FROM spans WHERE session_id = ?1",
+        params![as_sql_id(session_id)?],
+    )?;
+
+    for span in spans {
+        connection.execute(
+            "INSERT INTO spans (session_id, span_id, name, target, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                as_sql_id(session_id)?,
+                as_sql_u64(span.id.0)?,
+                span.name,
+                span.target,
+                serde_json::to_string(span)?,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn replace_resource_batch(
+    connection: &Connection,
+    session_id: SessionId,
+    resources: &[Resource],
+) -> Result<(), StoreError> {
+    connection.execute(
+        "DELETE FROM resources WHERE session_id = ?1",
+        params![as_sql_id(session_id)?],
+    )?;
+
+    for resource in resources {
+        connection.execute(
+            "INSERT INTO resources (session_id, resource_id, name, kind, payload_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                as_sql_id(session_id)?,
+                as_sql_u64(resource.id.0)?,
+                resource.name,
+                resource.kind,
+                serde_json::to_string(resource)?,
+            ],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn load_session_row(
+    connection: &Connection,
+    session_id: SessionId,
+) -> Result<Option<Session>, StoreError> {
+    let mut statement = connection.prepare(
+        "SELECT id, name, target_address, started_at, ended_at, metadata_json
+         FROM sessions
+         WHERE id = ?1",
+    )?;
+    let session = statement
+        .query_row(params![as_sql_id(session_id)?], map_session_row)
+        .optional()?;
+    Ok(session)
+}
+
+fn map_session_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+    let id = SessionId(
+        u64::try_from(row.get::<_, i64>(0)?)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
+    );
+    let started_at = parse_datetime(row.get::<_, String>(3)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    let ended_at = row
+        .get::<_, Option<String>>(4)?
+        .map(parse_datetime)
+        .transpose()
+        .map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?;
+    let metadata = serde_json::from_str(&row.get::<_, String>(5)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+
+    Ok(Session {
+        id,
+        name: row.get(1)?,
+        target_address: row.get(2)?,
+        started_at,
+        ended_at,
+        metadata,
+    })
 }
 
 fn as_sql_id(id: SessionId) -> Result<i64, StoreError> {

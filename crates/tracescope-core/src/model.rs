@@ -158,6 +158,18 @@ pub enum TaskState {
     Done,
 }
 
+impl fmt::Display for TaskState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Running => "Running",
+            Self::Idle => "Idle",
+            Self::Scheduled => "Scheduled",
+            Self::Done => "Done",
+        };
+        formatter.write_str(label)
+    }
+}
+
 /// Aggregated task timing and poll statistics.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskStats {
@@ -184,6 +196,16 @@ pub enum WarningKind {
     LongPoll,
     /// Task wakes itself repeatedly.
     SelfWake,
+}
+
+impl fmt::Display for WarningKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::LongPoll => "Long Poll",
+            Self::SelfWake => "Self Wake",
+        };
+        formatter.write_str(label)
+    }
 }
 
 /// Warning attached to a specific task.
@@ -284,6 +306,19 @@ pub enum SpanLevel {
     Trace,
     /// Unknown level provided by the source.
     Unknown(String),
+}
+
+impl fmt::Display for SpanLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Error => formatter.write_str("Error"),
+            Self::Warn => formatter.write_str("Warn"),
+            Self::Info => formatter.write_str("Info"),
+            Self::Debug => formatter.write_str("Debug"),
+            Self::Trace => formatter.write_str("Trace"),
+            Self::Unknown(value) => formatter.write_str(value),
+        }
+    }
 }
 
 /// A tracing span observed on the wire.

@@ -6,7 +6,8 @@ pub mod query;
 pub mod store;
 
 pub use collector::{
-    Collector, CollectorCommand, CollectorEvent, CollectorSnapshot, ConnectionState,
+    normalize_target, Collector, CollectorCommand, CollectorEvent, CollectorSnapshot,
+    ConnectionState,
 };
 pub use model::{
     DurationValue, FieldValue, LoadedSession, Resource, ResourceId, ResourceStats,

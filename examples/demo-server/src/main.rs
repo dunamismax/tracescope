@@ -27,6 +27,7 @@ async fn main() {
     tokio::spawn(mutex_worker("mutex-worker-a", Arc::clone(&shared), 3));
     tokio::spawn(mutex_worker("mutex-worker-b", Arc::clone(&shared), 5));
     tokio::spawn(interval_reporter(Arc::clone(&shared)));
+    drop(tx);
 
     info!("demo server running on Tokio console endpoint 127.0.0.1:6669");
 

@@ -43,7 +43,7 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
                     ui.label(&warning.task_name);
                 });
                 row.col(|ui| {
-                    ui.label(format!("{:?}", warning.kind));
+                    ui.label(warning.kind.to_string());
                 });
                 row.col(|ui| {
                     ui.label(&warning.message);

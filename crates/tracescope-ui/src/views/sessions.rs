@@ -43,8 +43,9 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
     });
 
     ui.add_space(8.0);
+    let filtered_sessions = app.filtered_sessions();
     egui::ScrollArea::vertical().show(ui, |ui| {
-        for session in app.filtered_sessions() {
+        for session in filtered_sessions {
             let selected = app.selected_session_id == Some(session.id);
             if ui
                 .selectable_label(
@@ -64,6 +65,8 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
 
         if app.sessions.is_empty() {
             ui.label("No saved sessions yet.");
+        } else if !app.session_filter.trim().is_empty() {
+            ui.label("No sessions match the current filter.");
         }
     });
 
