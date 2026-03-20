@@ -17,10 +17,11 @@ TraceScope is a native Rust desktop viewer for Tokio `console-subscriber` teleme
 
 - Desktop launch now smoke-tests successfully on the reviewed macOS machine after enabling native `wgpu` backend features through a direct `wgpu` dependency in the app crate.
 - The workspace root now owns `tokio_unstable` in `.cargo/config.toml`, so `cargo run -p demo-server` works from the repo root.
+- GitHub Actions CI now lives at `.github/workflows/ci.yml` and runs the verified Rust quality checks on Ubuntu plus build smoke tests on macOS and Windows.
 - Recording is still snapshot-based, not event-log-based.
 - Replay is still limited to loading a saved snapshot.
 - Timeline rendering is still simplified.
-- Compare/diff, migrations, CI, and richer integration coverage are still future work.
+- Compare/diff, migrations, and richer integration coverage are still future work.
 
 ## Technical Notes
 
@@ -52,3 +53,7 @@ Current automated coverage is still concentrated in `tracescope-core`, including
 - batch replacement persistence
 - delete cascade persistence
 - Criterion benches for snapshot save/load and query hot paths live at `crates/tracescope-core/benches/hot_paths.rs`
+
+CI note:
+
+- `.github/workflows/ci.yml` runs `fmt`, `build`, `clippy`, `test`, `nextest`, and `deny` on Ubuntu with `--locked`, plus build smoke tests on macOS and Windows.

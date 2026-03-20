@@ -1,5 +1,6 @@
 # TraceScope
 
+[![CI](https://github.com/sawyer/tracescope/actions/workflows/ci.yml/badge.svg)](https://github.com/sawyer/tracescope/actions/workflows/ci.yml)
 [![Work in Progress](https://img.shields.io/badge/status-work%20in%20progress-orange)](https://github.com/sawyer/tracescope)
 
 TraceScope is a native Rust desktop viewer for Tokio `console-subscriber` telemetry. It connects to a running async application over gRPC, keeps a live in-memory snapshot of tasks, spans, resources, and warnings, and can save the current snapshot to SQLite for later inspection.
@@ -49,6 +50,14 @@ cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo deny check
 ```
+
+## Continuous Integration
+
+GitHub Actions now runs the verified workspace checks in [`.github/workflows/ci.yml`](.github/workflows/ci.yml):
+
+- Ubuntu runs `cargo fmt`, `cargo build`, `cargo clippy`, `cargo test`, `cargo nextest`, and `cargo deny` with `--locked`.
+- macOS and Windows run `cargo build --workspace --locked` as desktop build smoke tests.
+- The workflow triggers on pull requests, pushes to `main`, and manual dispatches.
 
 ## Benchmarks And Test Tooling
 

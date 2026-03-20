@@ -7,8 +7,8 @@ This file is a **living document**. Every future agent or developer working in t
 If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
 
 Reviewed on: 2026-03-20
-Reviewed from commit: `4a498f4cee47827df538905d4267b0ee29e3d058` plus working-tree updates applied during this pass
-Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`
+Reviewed from commit: `bf7195d3f401982395247eb32237f5109c0233c1` plus working-tree updates applied during this pass
+Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`, `rustc 1.94.0`, `cargo 1.94.0`
 
 ## 1. Project Baseline
 
@@ -44,6 +44,9 @@ TraceScope is a Rust workspace for a native desktop async telemetry viewer:
 - Demo target: `examples/demo-server/src/main.rs`
   - Starts a Tokio application instrumented with `console_subscriber::init()`.
   - Emits producer/consumer/mutex/timer activity for manual testing.
+- CI workflow: `.github/workflows/ci.yml`
+  - Runs the verified Rust quality gates on `ubuntu-latest`.
+  - Runs workspace build smoke tests on `macos-latest` and `windows-latest`.
 
 ### Current implemented state
 
@@ -55,6 +58,7 @@ Implemented and visible in code:
 - Warning table derived from task stats.
 - Simplified timeline view that renders span duration bars only.
 - Session recording, listing, loading, and deletion backed by SQLite.
+- GitHub Actions CI for formatting, build, lint, test, nextest, deny, and cross-platform build smoke tests.
 - Collector support for:
   - `Instrument.watch_updates()` task/resource updates.
   - `Trace.watch()` span activity when the server supports it.
@@ -75,7 +79,8 @@ Operational reality: current recording saves the latest snapshot at stop time, n
 
 Verified or directly confirmed from the repo:
 
-- Rust/Cargo with toolchain support for `edition = "2021"` and `rust-version = "1.81"`.
+- Manifest declares `edition = "2021"` and `rust-version = "1.81"`.
+- Verified commands in this review pass ran with `rustc 1.94.0` and `cargo 1.94.0`.
 - No Node, Python, Docker, or database service is required for the current workspace.
 - SQLite is bundled via `rusqlite` feature `bundled`, so no system SQLite setup was required during review.
 
@@ -83,6 +88,7 @@ Likely platform requirements, not fully verified here:
 
 - Desktop GUI support suitable for `eframe`/`wgpu`.
 - On Linux, X11/Wayland runtime/dev packages are likely needed because the manifest enables `x11` and `wayland` features.
+- The GitHub Actions Ubuntu job installs `pkg-config`, ALSA, `udev`, X11, EGL/GL, `xkbcommon`, and Wayland development packages before building.
 
 ### Environment and configuration
 
@@ -131,6 +137,27 @@ cargo test --workspace
 cargo nextest run --workspace
 cargo deny check
 ```
+
+### CI workflow now present
+
+The repository now includes GitHub Actions CI at `.github/workflows/ci.yml`.
+
+- Triggers:
+  - pull requests
+  - pushes to `main`
+  - manual `workflow_dispatch`
+- `checks` job on `ubuntu-latest` runs:
+  - `cargo fmt --all -- --check`
+  - `cargo build --workspace --locked`
+  - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+  - `cargo test --workspace --locked`
+  - `cargo nextest run --workspace --locked`
+  - `cargo deny check`
+- `desktop-builds` matrix runs `cargo build --workspace --locked` on:
+  - `macos-latest`
+  - `windows-latest`
+
+Operational note: this CI workflow was reviewed locally for correctness and aligned with the passing command set above, but it was not executed on GitHub from this review environment.
 
 Run the core hot-path benchmarks:
 
@@ -183,7 +210,6 @@ There are no repo-provided commands for:
 - database migrations
 - seeding
 - packaging/release builds
-- CI wrappers
 - Docker-based local development
 
 ## 3. Source-Of-Truth Notes
@@ -202,6 +228,8 @@ There are no repo-provided commands for:
   - Canonical `cargo nextest` profile settings for this repo.
 - `deny.toml`
   - Canonical `cargo-deny` policy, including current advisory ignore and license allowlist.
+- `.github/workflows/ci.yml`
+  - Canonical CI workflow for pull requests and `main` branch pushes.
 - `crates/tracescope-core/src/model.rs`
   - Canonical schema for persisted and UI-rendered domain objects.
 - `crates/tracescope-core/src/store.rs`
@@ -216,6 +244,7 @@ There are no repo-provided commands for:
 ### Documentation quality and conflicts
 
 - `README.md` and `AGENTS.md` were reconciled in this pass to match current behavior.
+- `.github/workflows/ci.yml` was added in this pass and the docs were updated to describe it consistently.
 - `BUILD.md` still remains the operational source of truth because it tracks verified commands, gaps, and next-pass work in more detail than the shorter docs.
 
 ### Important configuration details
@@ -232,6 +261,9 @@ There are no repo-provided commands for:
   - Enforces `cargo-deny` across advisories, licenses, bans, and sources.
   - Current policy explicitly ignores `RUSTSEC-2024-0436` because it is transitive through `wgpu`/`metal` in the chosen UI stack.
   - Current bans policy leaves duplicate-version findings at `warn`, so `cargo deny check` succeeds but still prints duplicate dependency warnings.
+- `.github/workflows/ci.yml`
+  - Uses `stable` Rust in GitHub Actions rather than a separately verified MSRV toolchain job.
+  - Runs the full quality suite on Ubuntu and build smoke tests on macOS/Windows.
 - `crates/tracescope-app/src/main.rs`
   - Defaults persistence to `~/.tracescope`
   - Defaults the connection target to `127.0.0.1:6669`
@@ -263,7 +295,7 @@ There are no repo-provided commands for:
 - UI integration tests are absent.
   - Automated coverage is stronger in `tracescope-core` now, including query helpers, collector invariants, persistence, and Criterion hot-path benches.
 - No schema migration strategy exists for `sessions.db`.
-- No CI config is present in the repository.
+- CI currently validates on stable/latest Rust only; there is no dedicated MSRV (`1.81`) GitHub Actions job yet.
 
 ### Risk areas
 
@@ -340,6 +372,9 @@ Items fixed in this pass:
 5. Upgrade the recording model.
    - Move from snapshot-only persistence toward an event-log or timeline-oriented session format.
 
+6. Add MSRV or release-oriented CI only if needed.
+   - The current workflow covers day-to-day quality checks and cross-platform build smoke tests, but it does not verify `rust-version = "1.81"` separately or produce release artifacts.
+
 ### Deeper refactors
 
 - Replace snapshot-only recording with an event-log or timeline-oriented persistence model.
@@ -361,6 +396,8 @@ cargo fmt --all -- --check
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo nextest run --workspace
+cargo deny check
 ```
 
 5. For demo-server work, use either of these exact commands:
@@ -387,6 +424,9 @@ cd examples/demo-server && cargo run
 
 Verified current automated coverage:
 
+- GitHub Actions CI:
+  - `ubuntu-latest`: `fmt`, `build`, `clippy`, `test`, `nextest`, and `deny`
+  - `macos-latest` and `windows-latest`: `cargo build --workspace --locked`
 - `tracescope-core`
   - duration arithmetic test
   - warning derivation test
