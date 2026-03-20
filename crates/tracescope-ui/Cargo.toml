@@ -1,0 +1,14 @@
+[package]
+name = "tracescope-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+serde.workspace = true
+tracescope-core = { path = "../tracescope-core" }
