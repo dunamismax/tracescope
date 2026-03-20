@@ -37,13 +37,18 @@ Verified core checks:
 cargo fmt --all -- --check
 cargo build --workspace
 cargo test --workspace
+cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
 ```
 
 Current automated coverage is still concentrated in `tracescope-core`, including:
 
 - duration arithmetic
 - warning derivation
+- task/resource/session query filtering and ordering
+- collector task/resource/span aggregation invariants via `proptest`
 - session round-trip persistence
 - batch replacement persistence
 - delete cascade persistence
+- Criterion benches for snapshot save/load and query hot paths live at `crates/tracescope-core/benches/hot_paths.rs`

@@ -107,7 +107,11 @@ These commands were run successfully during this review unless marked as a verif
 | `cargo metadata --format-version 1 --no-deps` | Success | Confirms a 4-package workspace. |
 | `cargo fmt --all -- --check` | Success | Formatting is clean. |
 | `cargo build --workspace` | Success | All workspace members build. |
-| `cargo test --workspace` | Success | 5 tests pass, all in `tracescope-core`. |
+| `cargo test --workspace` | Success | 13 tests pass, concentrated in `tracescope-core` query/model/store/collector coverage. |
+| `cargo nextest run --workspace` | Success | Uses `.config/nextest.toml`; 13 tests pass under nextest. |
+| `cargo bench -p tracescope-core --bench hot_paths --no-run` | Success | Criterion bench target compiles cleanly. |
+| `cargo bench -p tracescope-core --bench hot_paths -- --sample-size 10` | Success | Smoke-ran snapshot import/query benches; save ~8.6-13.0 ms, load ~3.2-4.9 ms, task query ~264-357 us, resource query ~68-133 us. |
+| `cargo deny check` | Success | `deny.toml` passes with duplicate-version warnings left at `warn`. |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Success | No warnings under current code. |
 | `cargo run -p tracescope-app -- --help` | Success | CLI parsing works and prints options. |
 | `cargo run -p demo-server` | Success | Process stayed running from the workspace root; no `tokio_unstable` panic. |
@@ -124,6 +128,14 @@ cargo fmt --all -- --check
 cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+cargo nextest run --workspace
+cargo deny check
+```
+
+Run the core hot-path benchmarks:
+
+```bash
+cargo bench -p tracescope-core --bench hot_paths
 ```
 
 Run the demo server from the repository root:
@@ -186,12 +198,18 @@ There are no repo-provided commands for:
   - Canonical place where repo-wide `tokio_unstable` is configured.
 - `Cargo.lock`
   - Exact dependency resolution currently used by the repo.
+- `.config/nextest.toml`
+  - Canonical `cargo nextest` profile settings for this repo.
+- `deny.toml`
+  - Canonical `cargo-deny` policy, including current advisory ignore and license allowlist.
 - `crates/tracescope-core/src/model.rs`
   - Canonical schema for persisted and UI-rendered domain objects.
 - `crates/tracescope-core/src/store.rs`
   - Canonical SQLite schema and persistence behavior.
 - `crates/tracescope-core/src/collector.rs`
   - Canonical description of what live telemetry is actually collected and how warnings/states are derived.
+- `crates/tracescope-core/benches/hot_paths.rs`
+  - Canonical Criterion coverage for snapshot import/query hot paths.
 - `crates/tracescope-ui/src/app.rs`
   - Canonical description of what user actions the UI currently supports.
 
@@ -204,9 +222,16 @@ There are no repo-provided commands for:
 
 - `Cargo.toml`
   - `eframe = { default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }`
+  - Workspace dev tooling now pins `criterion = "0.5.1"` and `proptest = "1.6.0"` through shared workspace dependencies.
   - The app crate now also depends directly on `wgpu` with native backend features enabled (`dx12`, `gles`, `metal`, `vulkan`, `wgsl`) so the reviewed macOS launch path has a usable backend.
 - `.cargo/config.toml`
   - Applies `tokio_unstable` repo-wide, removing the working-directory trap for the demo server.
+- `.config/nextest.toml`
+  - Defines the default nextest profile with a 30-second slow-test timeout and two-term slow termination threshold.
+- `deny.toml`
+  - Enforces `cargo-deny` across advisories, licenses, bans, and sources.
+  - Current policy explicitly ignores `RUSTSEC-2024-0436` because it is transitive through `wgpu`/`metal` in the chosen UI stack.
+  - Current bans policy leaves duplicate-version findings at `warn`, so `cargo deny check` succeeds but still prints duplicate dependency warnings.
 - `crates/tracescope-app/src/main.rs`
   - Defaults persistence to `~/.tracescope`
   - Defaults the connection target to `127.0.0.1:6669`
@@ -214,6 +239,8 @@ There are no repo-provided commands for:
   - Creates the SQLite schema lazily if missing.
   - Persists full recorded snapshots transactionally via `save_session_snapshot`.
   - There is no migration framework yet.
+- `crates/tracescope-core/src/collector.rs`
+  - `CloseSpan` now updates `exited_at` to the final close timestamp instead of preserving an earlier exit.
 
 ## 4. Current Gaps And Known Issues
 
@@ -233,8 +260,8 @@ There are no repo-provided commands for:
 - Timeline is Phase-1 only.
   - Current UI renders proportional span bars without swimlanes, zoom, pan, or trace navigation.
 - Session comparison/diffing is absent.
-- UI and collector integration tests are absent.
-  - Existing tests cover only `tracescope-core` model/store behavior.
+- UI integration tests are absent.
+  - Automated coverage is stronger in `tracescope-core` now, including query helpers, collector invariants, persistence, and Criterion hot-path benches.
 - No schema migration strategy exists for `sessions.db`.
 - No CI config is present in the repository.
 
@@ -246,7 +273,7 @@ There are no repo-provided commands for:
 
 ## 5. Code Review Findings
 
-Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 5/5, `cargo fmt --check` clean.
+Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 13/13, `cargo nextest` 13/13, `cargo deny check` passes, and `cargo fmt --check` is clean.
 
 Items fixed in this pass:
 
@@ -256,8 +283,13 @@ Items fixed in this pass:
 - `timestamp_to_datetime` now validates protobuf nanoseconds with `u32::try_from`.
 - Recording persistence is now transactional across the session/tasks/spans/resources writes.
 - `CloseSpan` now cleans up `active_spans` and accounts for any final busy duration on close.
+- `CloseSpan` now also records the final close timestamp in `exited_at` so re-entered spans don't keep stale exit times.
 - UI cleanup landed for session-filter empty states, warning labels, timeline span labels, and enum text rendering.
 - The demo server now drops the original `tx` sender after spawning workers.
+- Query helper unit tests now cover task/resource/session filtering and ordering.
+- Collector property tests now cover task duration partitioning, span busy-time aggregation, and resource poll accounting invariants.
+- Criterion benches now cover snapshot save/load plus task/resource query hot paths in `tracescope-core`.
+- Workspace docs and config now include `cargo nextest` and `cargo-deny`.
 
 ### Severity: Medium
 

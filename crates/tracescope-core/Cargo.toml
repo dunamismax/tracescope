@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[[bench]]
+name = "hot_paths"
+harness = false
+
 [dependencies]
 chrono.workspace = true
 console-api.workspace = true
@@ -20,4 +24,6 @@ tonic.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
 tempfile.workspace = true

@@ -45,7 +45,25 @@ The workspace now includes a root `.cargo/config.toml` that enables `tokio_unsta
 cargo fmt --all -- --check
 cargo build --workspace
 cargo test --workspace
+cargo nextest run --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo deny check
+```
+
+## Benchmarks And Test Tooling
+
+`tracescope-core` now includes:
+
+- query helper unit tests
+- collector property tests powered by `proptest`
+- Criterion benches for snapshot save/load and task/resource query hot paths
+- repo-level `cargo nextest` config in `.config/nextest.toml`
+- repo-level `cargo-deny` policy in `deny.toml`
+
+Run the hot-path benches with:
+
+```bash
+cargo bench -p tracescope-core --bench hot_paths
 ```
 
 ## Workspace Layout
@@ -58,7 +76,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 ## Roadmap
 
 - End-to-end manual validation for connect, record, load, and delete
-- Collector and integration tests beyond the current core coverage
+- UI/integration coverage beyond the current core test and benchmark coverage
 - Event-log-based recording instead of snapshot-only persistence
 - Richer timeline and comparison workflows
 - Database migrations for persisted sessions

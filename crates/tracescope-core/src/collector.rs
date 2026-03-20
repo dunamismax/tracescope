@@ -363,7 +363,7 @@ impl CollectorState {
                 {
                     let span_id = SpanId(span_id.id);
                     if let Some(span) = self.spans.get_mut(&span_id) {
-                        span.exited_at.get_or_insert(at);
+                        span.exited_at = Some(at);
                         if let Some(started_at) = self.active_spans.remove(&span_id) {
                             span.busy_duration = span
                                 .busy_duration
@@ -702,6 +702,377 @@ fn derive_task_state(
                 }
             }
             TaskState::Idle
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use console_api::{
+        instrument::Update, metadata, register_metadata, resources, tasks, trace, Id, MetaId,
+        Metadata, PollStats, RegisterMetadata, Span as ApiSpan,
+    };
+    use proptest::{collection::vec, prelude::*};
+
+    use crate::model::{
+        DurationValue, FieldValue, Resource, ResourceId, ResourceStats, ResourceVisibility, Span,
+        SpanId, SpanLevel, Task, TaskId, TaskState, TaskStats, TaskWarning, WarningKind,
+    };
+
+    use super::{normalize_target, timestamp_to_datetime, CollectorState};
+
+    #[test]
+    fn normalize_target_adds_http_scheme_when_missing() {
+        assert_eq!(normalize_target("127.0.0.1:6669"), "http://127.0.0.1:6669");
+        assert_eq!(
+            normalize_target("https://demo.internal:7000"),
+            "https://demo.internal:7000"
+        );
+    }
+
+    #[test]
+    fn snapshot_sorts_entities_and_flattens_warning_records() {
+        let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+
+        state.tasks.insert(
+            TaskId(9),
+            Task {
+                id: TaskId(9),
+                name: String::from("beta"),
+                state: TaskState::Idle,
+                fields: BTreeMap::from([(
+                    String::from("queue"),
+                    FieldValue::String(String::from("critical")),
+                )]),
+                stats: TaskStats::default(),
+                warnings: vec![TaskWarning {
+                    kind: WarningKind::SelfWake,
+                    message: String::from("task self-woke 1 times"),
+                }],
+                created_at: None,
+                dropped_at: None,
+            },
+        );
+        state.tasks.insert(
+            TaskId(3),
+            Task {
+                id: TaskId(3),
+                name: String::from("alpha"),
+                state: TaskState::Running,
+                fields: BTreeMap::new(),
+                stats: TaskStats::default(),
+                warnings: vec![
+                    TaskWarning {
+                        kind: WarningKind::LongPoll,
+                        message: String::from("average poll time is 75 ms"),
+                    },
+                    TaskWarning {
+                        kind: WarningKind::SelfWake,
+                        message: String::from("task self-woke 2 times"),
+                    },
+                ],
+                created_at: None,
+                dropped_at: None,
+            },
+        );
+
+        state.spans.insert(SpanId(8), span_fixture(8));
+        state.spans.insert(SpanId(1), span_fixture(1));
+        state
+            .resources
+            .insert(ResourceId(5), resource_fixture(5, 2, 1));
+        state
+            .resources
+            .insert(ResourceId(2), resource_fixture(2, 1, 0));
+
+        let snapshot = state.snapshot();
+
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .map(|task| task.id.0)
+                .collect::<Vec<_>>(),
+            vec![3, 9]
+        );
+        assert_eq!(
+            snapshot
+                .spans
+                .iter()
+                .map(|span| span.id.0)
+                .collect::<Vec<_>>(),
+            vec![1, 8]
+        );
+        assert_eq!(
+            snapshot
+                .resources
+                .iter()
+                .map(|resource| resource.id.0)
+                .collect::<Vec<_>>(),
+            vec![2, 5]
+        );
+        assert_eq!(snapshot.warnings.len(), 3);
+        assert_eq!(snapshot.warnings[0].task_id, TaskId(3));
+    }
+
+    proptest! {
+        #[test]
+        fn task_stat_aggregation_partitions_total_duration(
+            (total_micros, busy_micros, scheduled_micros, polls, wakes, self_wakes) in task_stats_strategy()
+        ) {
+            let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+            state.apply_update(Update {
+                now: timestamp(total_micros),
+                task_update: Some(tasks::TaskUpdate {
+                    new_tasks: vec![tasks::Task {
+                        id: id(1),
+                        ..Default::default()
+                    }],
+                    stats_update: HashMap::from([(
+                        1,
+                        tasks::Stats {
+                            created_at: timestamp(0),
+                            dropped_at: timestamp(total_micros),
+                            wakes,
+                            poll_stats: Some(PollStats {
+                                polls,
+                                last_poll_started: timestamp(total_micros),
+                                last_poll_ended: timestamp(total_micros),
+                                busy_time: duration(busy_micros),
+                                ..Default::default()
+                            }),
+                            self_wakes,
+                            scheduled_time: duration(scheduled_micros),
+                            ..Default::default()
+                        },
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+            let task = state.tasks.get(&TaskId(1)).expect("task inserted");
+
+            prop_assert_eq!(task.state, TaskState::Done);
+            prop_assert_eq!(task.stats.total_duration.as_micros(), total_micros);
+            prop_assert_eq!(task.stats.busy_duration.as_micros(), busy_micros);
+            prop_assert_eq!(task.stats.scheduled_duration.as_micros(), scheduled_micros);
+            prop_assert_eq!(
+                task.stats.idle_duration.as_micros(),
+                total_micros - busy_micros - scheduled_micros
+            );
+            prop_assert_eq!(
+                task.stats.idle_duration.as_micros()
+                    + task.stats.busy_duration.as_micros()
+                    + task.stats.scheduled_duration.as_micros(),
+                task.stats.total_duration.as_micros()
+            );
+        }
+
+        #[test]
+        fn span_timeline_busy_duration_matches_enter_exit_intervals(
+            intervals in vec((0u64..20_000, 0u64..20_000), 1..12)
+        ) {
+            let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+            state.apply_trace_event(trace::TraceEvent {
+                event: Some(trace::trace_event::Event::RegisterMetadata(register_metadata(7, "timeline", "demo"))),
+            });
+            state.apply_trace_event(trace::TraceEvent {
+                event: Some(trace::trace_event::Event::NewSpan(ApiSpan {
+                    id: span_id(1),
+                    metadata_id: meta_id(7),
+                    at: timestamp(0),
+                    ..Default::default()
+                })),
+            });
+
+            let mut clock = 0;
+            let mut expected_busy = 0;
+
+            for (index, (gap_micros, busy_micros)) in intervals.iter().copied().enumerate() {
+                clock += gap_micros;
+                state.apply_trace_event(enter_span_event(1, clock));
+                clock += busy_micros;
+                expected_busy += busy_micros;
+
+                let event = if index + 1 == intervals.len() {
+                    close_span_event(1, clock)
+                } else {
+                    exit_span_event(1, clock)
+                };
+                state.apply_trace_event(event);
+            }
+
+            let span = state.spans.get(&SpanId(1)).expect("span recorded");
+
+            prop_assert_eq!(span.busy_duration.as_micros(), expected_busy);
+            prop_assert!(state.active_spans.is_empty());
+            prop_assert_eq!(span.entered_at, timestamp_to_datetime(timestamp(0)));
+            prop_assert_eq!(span.exited_at, timestamp_to_datetime(timestamp(clock)));
+        }
+
+        #[test]
+        fn resource_poll_aggregation_counts_ready_and_pending_ops(ready_flags in vec(any::<bool>(), 0..64)) {
+            let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+            state.apply_resource_update(resources::ResourceUpdate {
+                new_resources: vec![resources::Resource {
+                    id: id(1),
+                    concrete_type: String::from("tokio::time::Sleep"),
+                    kind: Some(resources::resource::Kind {
+                        kind: Some(resources::resource::kind::Kind::Known(
+                            resources::resource::kind::Known::Timer as i32,
+                        )),
+                    }),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            state.apply_resource_update(resources::ResourceUpdate {
+                new_poll_ops: ready_flags
+                    .iter()
+                    .copied()
+                    .map(|is_ready| resources::PollOp {
+                        resource_id: id(1),
+                        is_ready,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            });
+
+            let resource = state.resources.get(&ResourceId(1)).expect("resource inserted");
+            let ready_count = ready_flags.iter().filter(|is_ready| **is_ready).count() as u64;
+            let pending_count = ready_flags.len() as u64 - ready_count;
+
+            prop_assert_eq!(resource.stats.ready_count, ready_count);
+            prop_assert_eq!(resource.stats.pending_count, pending_count);
+            prop_assert_eq!(resource.stats.poll_op_count, ready_count + pending_count);
+        }
+    }
+
+    fn task_stats_strategy() -> impl Strategy<Value = (u64, u64, u64, u64, u64, u64)> {
+        (0u64..5_000_000, 0u64..256, 0u64..256, 0u64..256).prop_flat_map(
+            |(total_micros, polls, wakes, self_wakes)| {
+                (Just(total_micros), 0u64..=total_micros).prop_flat_map(
+                    move |(total_micros, busy_micros)| {
+                        (
+                            Just(total_micros),
+                            Just(busy_micros),
+                            0u64..=(total_micros - busy_micros),
+                            Just(polls),
+                            Just(wakes),
+                            Just(self_wakes),
+                        )
+                    },
+                )
+            },
+        )
+    }
+
+    fn id(value: u64) -> Option<Id> {
+        Some(Id { id: value })
+    }
+
+    fn span_id(value: u64) -> Option<console_api::SpanId> {
+        Some(console_api::SpanId { id: value })
+    }
+
+    fn meta_id(value: u64) -> Option<MetaId> {
+        Some(MetaId { id: value })
+    }
+
+    fn timestamp(micros: u64) -> Option<prost_types::Timestamp> {
+        let seconds = i64::try_from(micros / 1_000_000).expect("seconds fit in i64");
+        let nanos = i32::try_from((micros % 1_000_000) * 1_000).expect("nanos fit in i32");
+        Some(prost_types::Timestamp { seconds, nanos })
+    }
+
+    fn duration(micros: u64) -> Option<prost_types::Duration> {
+        let seconds = i64::try_from(micros / 1_000_000).expect("seconds fit in i64");
+        let nanos = i32::try_from((micros % 1_000_000) * 1_000).expect("nanos fit in i32");
+        Some(prost_types::Duration { seconds, nanos })
+    }
+
+    fn register_metadata(id: u64, name: &str, target: &str) -> RegisterMetadata {
+        RegisterMetadata {
+            metadata: vec![register_metadata::NewMetadata {
+                id: meta_id(id),
+                metadata: Some(Metadata {
+                    name: name.to_string(),
+                    target: target.to_string(),
+                    module_path: String::from("tracescope::tests"),
+                    location: None,
+                    kind: metadata::Kind::Span as i32,
+                    level: metadata::Level::Info as i32,
+                    field_names: Vec::new(),
+                }),
+            }],
+        }
+    }
+
+    fn enter_span_event(span_id_value: u64, at_micros: u64) -> trace::TraceEvent {
+        trace::TraceEvent {
+            event: Some(trace::trace_event::Event::EnterSpan(
+                trace::trace_event::Enter {
+                    span_id: span_id(span_id_value),
+                    at: timestamp(at_micros),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn exit_span_event(span_id_value: u64, at_micros: u64) -> trace::TraceEvent {
+        trace::TraceEvent {
+            event: Some(trace::trace_event::Event::ExitSpan(
+                trace::trace_event::Exit {
+                    span_id: span_id(span_id_value),
+                    at: timestamp(at_micros),
+                    ..Default::default()
+                },
+            )),
+        }
+    }
+
+    fn close_span_event(span_id_value: u64, at_micros: u64) -> trace::TraceEvent {
+        trace::TraceEvent {
+            event: Some(trace::trace_event::Event::CloseSpan(
+                trace::trace_event::Close {
+                    span_id: span_id(span_id_value),
+                    at: timestamp(at_micros),
+                },
+            )),
+        }
+    }
+
+    fn span_fixture(id: u64) -> Span {
+        Span {
+            id: SpanId(id),
+            parent_id: None,
+            name: format!("span-{id}"),
+            target: String::from("demo"),
+            level: SpanLevel::Info,
+            fields: BTreeMap::new(),
+            entered_at: None,
+            exited_at: None,
+            busy_duration: DurationValue::from_millis(5),
+        }
+    }
+
+    fn resource_fixture(id: u64, ready_count: u64, pending_count: u64) -> Resource {
+        Resource {
+            id: ResourceId(id),
+            kind: String::from("timer"),
+            name: format!("resource-{id}"),
+            stats: ResourceStats {
+                poll_op_count: ready_count + pending_count,
+                ready_count,
+                pending_count,
+                ..ResourceStats::default()
+            },
+            visibility: ResourceVisibility::Visible,
         }
     }
 }
