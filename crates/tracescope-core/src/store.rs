@@ -2,8 +2,9 @@
 
 use std::{
     collections::BTreeMap,
-    fs,
+    fmt, fs,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
 };
 
 use chrono::{DateTime, Utc};
@@ -45,15 +46,31 @@ pub enum StoreError {
     /// Session identifier overflowed the supported range.
     #[error("numeric conversion failed while handling a session identifier")]
     IdConversion,
+    /// The store was created by a newer unsupported schema version.
+    #[error("database schema version {found} is newer than supported version {supported}")]
+    UnsupportedSchemaVersion { found: i32, supported: i32 },
+    /// The shared SQLite connection was poisoned by a panic while in use.
+    #[error("session store connection became unavailable after a panic")]
+    ConnectionPoisoned,
     /// The requested session does not exist.
     #[error("session {0} was not found")]
     SessionNotFound(SessionId),
 }
 
 /// SQLite-backed store for recorded sessions.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SessionStore {
     database_path: PathBuf,
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl fmt::Debug for SessionStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionStore")
+            .field("database_path", &self.database_path)
+            .finish()
+    }
 }
 
 impl SessionStore {
@@ -68,8 +85,13 @@ impl SessionStore {
         let data_dir = path.as_ref();
         fs::create_dir_all(data_dir)?;
         let database_path = data_dir.join("sessions.db");
-        let store = Self { database_path };
-        store.initialize()?;
+        let mut connection = Connection::open(&database_path)?;
+        configure_connection(&connection)?;
+        migrate_schema(&mut connection)?;
+        let store = Self {
+            database_path,
+            connection: Arc::new(Mutex::new(connection)),
+        };
         Ok(store)
     }
 
@@ -81,8 +103,7 @@ impl SessionStore {
 
     /// Creates a new session and returns its assigned identifier.
     pub fn create_session(&self, draft: &SessionDraft) -> Result<SessionId, StoreError> {
-        let connection = self.connection()?;
-        insert_session(&connection, draft)
+        self.with_connection(|connection| insert_session(connection, draft))
     }
 
     /// Persists a full recorded snapshot in a single transaction.
@@ -93,34 +114,37 @@ impl SessionStore {
         spans: &[Span],
         resources: &[Resource],
     ) -> Result<SessionId, StoreError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
+        self.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
 
-        let session_id = insert_session(&transaction, draft)?;
-        replace_task_batch(&transaction, session_id, tasks)?;
-        replace_span_batch(&transaction, session_id, spans)?;
-        replace_resource_batch(&transaction, session_id, resources)?;
+            let session_id = insert_session(&transaction, draft)?;
+            replace_task_batch(&transaction, session_id, tasks)?;
+            replace_span_batch(&transaction, session_id, spans)?;
+            replace_resource_batch(&transaction, session_id, resources)?;
 
-        transaction.commit()?;
-        Ok(session_id)
+            transaction.commit()?;
+            Ok(session_id)
+        })
     }
 
     /// Persists a full batch of tasks for a session.
     pub fn save_task_batch(&self, session_id: SessionId, tasks: &[Task]) -> Result<(), StoreError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        replace_task_batch(&transaction, session_id, tasks)?;
-        transaction.commit()?;
-        Ok(())
+        self.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            replace_task_batch(&transaction, session_id, tasks)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Persists a full batch of spans for a session.
     pub fn save_span_batch(&self, session_id: SessionId, spans: &[Span]) -> Result<(), StoreError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        replace_span_batch(&transaction, session_id, spans)?;
-        transaction.commit()?;
-        Ok(())
+        self.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            replace_span_batch(&transaction, session_id, spans)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Persists a full batch of resources for a session.
@@ -129,153 +153,191 @@ impl SessionStore {
         session_id: SessionId,
         resources: &[Resource],
     ) -> Result<(), StoreError> {
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction()?;
-        replace_resource_batch(&transaction, session_id, resources)?;
-        transaction.commit()?;
-        Ok(())
+        self.with_connection_mut(|connection| {
+            let transaction = connection.transaction()?;
+            replace_resource_batch(&transaction, session_id, resources)?;
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Lists all persisted sessions in reverse chronological order.
     pub fn list_sessions(&self) -> Result<Vec<Session>, StoreError> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, name, target_address, started_at, ended_at, metadata_json
-             FROM sessions
-             ORDER BY started_at DESC",
-        )?;
+        self.with_connection(|connection| {
+            let mut statement = connection.prepare(
+                "SELECT id, name, target_address, started_at, ended_at, metadata_json
+                 FROM sessions
+                 ORDER BY started_at DESC",
+            )?;
 
-        let rows = statement.query_map([], |row| {
-            let id = SessionId(
-                u64::try_from(row.get::<_, i64>(0)?)
-                    .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, 0))?,
-            );
-            let started_at = parse_datetime(row.get::<_, String>(3)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    3,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            let ended_at = row
-                .get::<_, Option<String>>(4)?
-                .map(parse_datetime)
-                .transpose()
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        4,
-                        rusqlite::types::Type::Text,
-                        Box::new(error),
-                    )
-                })?;
-            let metadata = serde_json::from_str(&row.get::<_, String>(5)?).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
+            let rows = statement.query_map([], map_session_row)?;
 
-            Ok(Session {
-                id,
-                name: row.get(1)?,
-                target_address: row.get(2)?,
-                started_at,
-                ended_at,
-                metadata,
-            })
-        })?;
+            let mut sessions = Vec::new();
+            for row in rows {
+                sessions.push(row?);
+            }
 
-        let mut sessions = Vec::new();
-        for row in rows {
-            sessions.push(row?);
-        }
-
-        Ok(sessions)
+            Ok(sessions)
+        })
     }
 
     /// Loads all persisted data for a single session.
     pub fn load_session(&self, session_id: SessionId) -> Result<LoadedSession, StoreError> {
-        let connection = self.connection()?;
-        let session = load_session_row(&connection, session_id)?
-            .ok_or(StoreError::SessionNotFound(session_id))?;
-        let tasks = load_payloads::<Task>(&connection, PayloadTable::Tasks, session_id)?;
-        let spans = load_payloads::<Span>(&connection, PayloadTable::Spans, session_id)?;
-        let resources =
-            load_payloads::<Resource>(&connection, PayloadTable::Resources, session_id)?;
+        self.with_connection(|connection| {
+            let session = load_session_row(connection, session_id)?
+                .ok_or(StoreError::SessionNotFound(session_id))?;
+            let tasks = load_payloads::<Task>(connection, PayloadTable::Tasks, session_id)?;
+            let spans = load_payloads::<Span>(connection, PayloadTable::Spans, session_id)?;
+            let resources =
+                load_payloads::<Resource>(connection, PayloadTable::Resources, session_id)?;
 
-        Ok(LoadedSession {
-            session,
-            tasks,
-            spans,
-            resources,
+            Ok(LoadedSession {
+                session,
+                tasks,
+                spans,
+                resources,
+            })
         })
     }
 
     /// Deletes a session and all related rows.
     pub fn delete_session(&self, session_id: SessionId) -> Result<(), StoreError> {
-        let connection = self.connection()?;
-        connection.execute(
-            "DELETE FROM sessions WHERE id = ?1",
-            params![as_sql_id(session_id)?],
-        )?;
-        Ok(())
+        self.with_connection(|connection| {
+            connection.execute(
+                "DELETE FROM sessions WHERE id = ?1",
+                params![as_sql_id(session_id)?],
+            )?;
+            Ok(())
+        })
     }
 
-    fn initialize(&self) -> Result<(), StoreError> {
-        let connection = self.connection()?;
-        connection.execute_batch(
-            "
-            PRAGMA foreign_keys = ON;
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                target_address TEXT NOT NULL,
-                started_at TEXT NOT NULL,
-                ended_at TEXT,
-                metadata_json TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                task_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                state TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS spans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                span_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                target TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS resources (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id INTEGER NOT NULL,
-                resource_id INTEGER NOT NULL,
-                name TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            ",
-        )?;
-        Ok(())
+    fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::ConnectionPoisoned)?;
+        operation(&connection)
     }
 
-    fn connection(&self) -> Result<Connection, StoreError> {
-        let connection = Connection::open(&self.database_path)?;
-        connection.pragma_update(None, "foreign_keys", "ON")?;
-        Ok(connection)
+    fn with_connection_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| StoreError::ConnectionPoisoned)?;
+        operation(&mut connection)
     }
+}
+
+const LATEST_SCHEMA_VERSION: i32 = 2;
+
+fn configure_connection(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        ",
+    )?;
+    Ok(())
+}
+
+fn migrate_schema(connection: &mut Connection) -> Result<(), StoreError> {
+    let mut current_version = schema_version(connection)?;
+    if current_version > LATEST_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchemaVersion {
+            found: current_version,
+            supported: LATEST_SCHEMA_VERSION,
+        });
+    }
+
+    while current_version < LATEST_SCHEMA_VERSION {
+        let next_version = current_version + 1;
+        let transaction = connection.transaction()?;
+        match next_version {
+            1 => apply_migration_v1(&transaction)?,
+            2 => apply_migration_v2(&transaction)?,
+            _ => unreachable!("all supported migrations are matched above"),
+        }
+        transaction.pragma_update(None, "user_version", next_version)?;
+        transaction.commit()?;
+        current_version = next_version;
+    }
+
+    Ok(())
+}
+
+fn schema_version(connection: &Connection) -> Result<i32, StoreError> {
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(StoreError::from)
+}
+
+fn apply_migration_v1(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            target_address TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            metadata_json TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            state TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS spans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            span_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            target TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS resources (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id INTEGER NOT NULL,
+            resource_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+fn apply_migration_v2(connection: &Connection) -> Result<(), StoreError> {
+    connection.execute_batch(
+        "
+        CREATE INDEX IF NOT EXISTS idx_sessions_started_at
+            ON sessions (started_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_tasks_session_task
+            ON tasks (session_id, task_id);
+        CREATE INDEX IF NOT EXISTS idx_spans_session_span
+            ON spans (session_id, span_id);
+        CREATE INDEX IF NOT EXISTS idx_resources_session_resource
+            ON resources (session_id, resource_id);
+        ",
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -491,6 +553,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use chrono::{Duration, Utc};
+    use rusqlite::Connection;
     use tempfile::tempdir;
 
     use crate::model::{
@@ -498,7 +561,7 @@ mod tests {
         SpanId, SpanLevel, Task, TaskId, TaskState, TaskStats,
     };
 
-    use super::{as_sql_id, SessionDraft, SessionStore};
+    use super::{as_sql_id, schema_version, SessionDraft, SessionStore, LATEST_SCHEMA_VERSION};
 
     #[test]
     fn session_round_trip_works() {
@@ -635,13 +698,16 @@ mod tests {
         let loaded = store.load_session(session_id).expect("load session");
         assert_eq!(loaded.tasks, vec![replacement_task]);
 
-        let connection = store.connection().expect("connection");
-        let task_count: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE session_id = ?1",
-                [as_sql_id(session_id).expect("session id")],
-                |row| row.get(0),
-            )
+        let task_count: i64 = store
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM tasks WHERE session_id = ?1",
+                        [as_sql_id(session_id)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
             .expect("task count");
         assert_eq!(task_count, 1);
     }
@@ -709,14 +775,150 @@ mod tests {
 
         store.delete_session(session_id).expect("delete session");
 
-        let connection = store.connection().expect("connection");
         for table in ["tasks", "spans", "resources"] {
-            let count: i64 = connection
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
+            let count: i64 = store
+                .with_connection(|connection| {
+                    connection
+                        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                            row.get(0)
+                        })
+                        .map_err(Into::into)
                 })
                 .expect("count");
             assert_eq!(count, 0, "{table} rows should be deleted");
         }
+    }
+
+    #[test]
+    fn opening_existing_unversioned_database_applies_migrations_without_losing_data() {
+        let temp = tempdir().expect("tempdir");
+        let database_path = temp.path().join("sessions.db");
+        let started_at = Utc::now();
+        let ended_at = started_at + Duration::seconds(2);
+
+        {
+            let connection = Connection::open(&database_path).expect("legacy connection");
+            connection
+                .execute_batch(
+                    "
+                    CREATE TABLE sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        target_address TEXT NOT NULL,
+                        started_at TEXT NOT NULL,
+                        ended_at TEXT,
+                        metadata_json TEXT NOT NULL
+                    );
+
+                    CREATE TABLE tasks (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        task_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE spans (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        span_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE resources (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER NOT NULL,
+                        resource_id INTEGER NOT NULL,
+                        name TEXT NOT NULL,
+                        kind TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                    );
+                    ",
+                )
+                .expect("legacy schema");
+
+            connection
+                .execute(
+                    "INSERT INTO sessions (id, name, target_address, started_at, ended_at, metadata_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        1_i64,
+                        "legacy session",
+                        "http://127.0.0.1:6669",
+                        started_at.to_rfc3339(),
+                        ended_at.to_rfc3339(),
+                        "{\"source\":\"legacy\"}",
+                    ],
+                )
+                .expect("insert session");
+            connection
+                .execute(
+                    "INSERT INTO tasks (session_id, task_id, name, state, payload_json)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        1_i64,
+                        42_i64,
+                        "legacy task",
+                        "Idle",
+                        serde_json::to_string(&Task {
+                            id: TaskId(42),
+                            name: "legacy task".to_string(),
+                            state: TaskState::Idle,
+                            fields: BTreeMap::new(),
+                            stats: TaskStats::default(),
+                            warnings: Vec::new(),
+                            created_at: Some(started_at),
+                            dropped_at: Some(ended_at),
+                        })
+                        .expect("serialize task"),
+                    ],
+                )
+                .expect("insert task");
+        }
+
+        let store = SessionStore::open_in_dir(temp.path()).expect("open migrated store");
+
+        let version = store
+            .with_connection(schema_version)
+            .expect("schema version");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+
+        let index_names: Vec<String> = store
+            .with_connection(|connection| {
+                let mut statement = connection.prepare(
+                    "SELECT name FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'idx_%'
+                     ORDER BY name ASC",
+                )?;
+                let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+                let mut names = Vec::new();
+                for row in rows {
+                    names.push(row?);
+                }
+                Ok(names)
+            })
+            .expect("index names");
+        assert_eq!(
+            index_names,
+            vec![
+                "idx_resources_session_resource".to_string(),
+                "idx_sessions_started_at".to_string(),
+                "idx_spans_session_span".to_string(),
+                "idx_tasks_session_task".to_string(),
+            ]
+        );
+
+        let loaded = store
+            .load_session(SessionId(1))
+            .expect("load migrated session");
+        assert_eq!(loaded.session.name, "legacy session");
+        assert_eq!(loaded.tasks.len(), 1);
+        assert_eq!(loaded.tasks[0].id, TaskId(42));
     }
 }

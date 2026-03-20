@@ -7,7 +7,7 @@ This file is a **living document**. Every future agent or developer working in t
 If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
 
 Reviewed on: 2026-03-20
-Reviewed from commit: `bf7195d3f401982395247eb32237f5109c0233c1` plus working-tree updates applied during this pass
+Reviewed from commit: `c689af0730e8166d59b3dec0600fb964c321c859` plus working-tree updates applied during this pass
 Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`, `rustc 1.94.0`, `cargo 1.94.0`
 
 ## 1. Project Baseline
@@ -58,6 +58,7 @@ Implemented and visible in code:
 - Warning table derived from task stats.
 - Simplified timeline view that renders span duration bars only.
 - Session recording, listing, loading, and deletion backed by SQLite.
+- Session persistence now uses a shared SQLite connection, enables WAL mode, and applies automatic schema migrations on open.
 - GitHub Actions CI for formatting, build, lint, test, nextest, deny, and cross-platform build smoke tests.
 - Collector support for:
   - `Instrument.watch_updates()` task/resource updates.
@@ -113,8 +114,8 @@ These commands were run successfully during this review unless marked as a verif
 | `cargo metadata --format-version 1 --no-deps` | Success | Confirms a 4-package workspace. |
 | `cargo fmt --all -- --check` | Success | Formatting is clean. |
 | `cargo build --workspace` | Success | All workspace members build. |
-| `cargo test --workspace` | Success | 13 tests pass, concentrated in `tracescope-core` query/model/store/collector coverage. |
-| `cargo nextest run --workspace` | Success | Uses `.config/nextest.toml`; 13 tests pass under nextest. |
+| `cargo test --workspace` | Success | 14 tests pass, including the new store migration-preservation test in `tracescope-core`. |
+| `cargo nextest run --workspace` | Success | Uses `.config/nextest.toml`; 14 tests pass under nextest. |
 | `cargo bench -p tracescope-core --bench hot_paths --no-run` | Success | Criterion bench target compiles cleanly. |
 | `cargo bench -p tracescope-core --bench hot_paths -- --sample-size 10` | Success | Smoke-ran snapshot import/query benches; save ~8.6-13.0 ms, load ~3.2-4.9 ms, task query ~264-357 us, resource query ~68-133 us. |
 | `cargo deny check` | Success | `deny.toml` passes with duplicate-version warnings left at `warn`. |
@@ -207,7 +208,7 @@ These were not fully verified end-to-end in this pass:
 
 There are no repo-provided commands for:
 
-- database migrations
+- database migrations beyond automatic store-open migrations
 - seeding
 - packaging/release builds
 - Docker-based local development
@@ -268,9 +269,10 @@ There are no repo-provided commands for:
   - Defaults persistence to `~/.tracescope`
   - Defaults the connection target to `127.0.0.1:6669`
 - `crates/tracescope-core/src/store.rs`
-  - Creates the SQLite schema lazily if missing.
+  - Opens a shared SQLite connection for the app process.
+  - Configures `foreign_keys = ON`, `journal_mode = WAL`, and `synchronous = NORMAL`.
+  - Applies versioned SQLite migrations automatically via `PRAGMA user_version`.
   - Persists full recorded snapshots transactionally via `save_session_snapshot`.
-  - There is no migration framework yet.
 - `crates/tracescope-core/src/collector.rs`
   - `CloseSpan` now updates `exited_at` to the final close timestamp instead of preserving an earlier exit.
 
@@ -294,21 +296,27 @@ There are no repo-provided commands for:
 - Session comparison/diffing is absent.
 - UI integration tests are absent.
   - Automated coverage is stronger in `tracescope-core` now, including query helpers, collector invariants, persistence, and Criterion hot-path benches.
-- No schema migration strategy exists for `sessions.db`.
+- The migration framework is still early-stage.
+  - Current migrations cover the baseline schema plus read/query indexes.
+  - Rollback/downgrade behavior is not implemented.
 - CI currently validates on stable/latest Rust only; there is no dedicated MSRV (`1.81`) GitHub Actions job yet.
 
 ### Risk areas
 
 - Cross-platform desktop launch behavior needs broader validation on Linux and Windows even though the reviewed macOS launch path is fixed.
 - Repo-wide `tokio_unstable` is convenient for local development, but it is still a global build setting that should be kept in mind if new crates are added later.
-- Schema evolution will be risky once persisted session data matters, because the DB schema is created inline with no migration layer.
+- Schema evolution now has a forward migration path, but downgrade handling and compatibility across multiple historical versions are still untested.
 
 ## 5. Code Review Findings
 
-Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 13/13, `cargo nextest` 13/13, `cargo deny check` passes, and `cargo fmt --check` is clean.
+Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 14/14, `cargo nextest` 14/14, `cargo deny check` passes, and `cargo fmt --check` is clean.
 
 Items fixed in this pass:
 
+- `SessionStore` now keeps a shared SQLite `Connection` instead of opening a fresh connection per operation.
+- SQLite initialization now applies explicit schema versions and automatic migrations using `PRAGMA user_version`.
+- Store initialization now enables `WAL` mode and creates read/query indexes for sessions, tasks, spans, and resources.
+- Store tests now verify that opening a legacy unversioned `sessions.db` migrates it in place without losing persisted rows.
 - `normalize_target` is now owned by `tracescope-core` and reused by the app.
 - `load_session` now queries the requested session row directly instead of scanning `list_sessions()`.
 - Session payload loading now uses fixed allowlisted SQL statements instead of interpolated table/column names.
@@ -325,26 +333,25 @@ Items fixed in this pass:
 
 ### Severity: Medium
 
-1. **New connection per store operation** (`store.rs:274-278`)
-   - Every `SessionStore` method opens a new `Connection`. SQLite `open()` is cheap for bundled mode, but this prevents using WAL mode or connection pooling effectively, and the repeated `PRAGMA foreign_keys = ON` on every call is a symptom. Consider holding a persistent connection (or using a pool) and setting pragmas once.
+No medium-severity findings remain from this pass.
 
 ### Severity: Low
 
-2. **`FieldValue::as_display` allocates a new `String` for every call** (`model.rs:121-128`)
+1. **`FieldValue::as_display` allocates a new `String` for every call** (`model.rs`)
    - Returns `String` even for the `Debug` and `String` variants where a `&str` borrow would suffice. Called in the hot filter path (`query.rs:101`). Consider returning `Cow<'_, str>` or `&str` if filtering performance matters later.
 
-3. **`query_tasks` and `query_resources` clone all matching items** (`query.rs:104`, `query.rs:145`)
+2. **`query_tasks` and `query_resources` clone all matching items** (`query.rs`)
    - Every frame recomputes the filtered/sorted list by cloning all matching tasks and resources. At current data volumes this is fine. If task counts grow to thousands, consider caching the sorted result and invalidating on snapshot change.
 
-4. **100ms repaint timer** (`app.rs:341`)
+3. **100ms repaint timer** (`app.rs`)
    - `ctx.request_repaint_after(Duration::from_millis(100))` runs at ~10 FPS equivalent. This is reasonable for a data viewer but means the UI will not reflect new data faster than 100ms even if the collector emits faster.
 
 ### Severity: Informational (architecture notes)
 
-5. **Recording remains snapshot-only** (`app.rs:58-61`, `store.rs:84-100`)
+4. **Recording remains snapshot-only** (`app.rs`, `store.rs`)
    - Recording still only tracks start time plus the final snapshot written at stop time. The transactional write fixed partial-session persistence, but it did not change the underlying snapshot-only data model.
 
-6. **Collector and UI integration coverage is still absent.**
+5. **Collector and UI integration coverage is still absent.**
    - Automated coverage remains concentrated in `tracescope-core`. The highest-risk flows still need tests around collector state transitions and session interactions.
 
 ## 6. Next-Pass Priorities
@@ -359,27 +366,24 @@ Items fixed in this pass:
    - Session load/delete works.
 
 2. Add tests where current risk is highest.
-   - Collector-state transformation tests.
    - UI/session-flow tests if practical.
+   - A manual-or-automated persistence smoke test that exercises the app/store boundary.
    - If practical, a small integration test for demo-server compatibility.
 
-3. Introduce migrations before evolving `sessions.db`.
-   - The inline schema creation is fine for now but will get risky as persisted data becomes more important.
-
-4. Consolidate store connection management.
-   - The transactional snapshot write improved correctness, but `SessionStore` still opens a fresh SQLite connection for every operation.
-
-5. Upgrade the recording model.
+3. Upgrade the recording model.
    - Move from snapshot-only persistence toward an event-log or timeline-oriented session format.
 
-6. Add MSRV or release-oriented CI only if needed.
+4. Exercise the migration framework with the first intentional schema evolution.
+   - Add at least one data-shape change beyond index creation.
+   - Decide whether downgrades, compatibility windows, or backup/repair flows are required.
+
+5. Add MSRV or release-oriented CI only if needed.
    - The current workflow covers day-to-day quality checks and cross-platform build smoke tests, but it does not verify `rust-version = "1.81"` separately or produce release artifacts.
 
 ### Deeper refactors
 
 - Replace snapshot-only recording with an event-log or timeline-oriented persistence model.
-- Introduce database migrations.
-- Consolidate connection management (single persistent `Connection` or pool).
+- Extend the migration framework with future schema changes and compatibility policy.
 - Build the richer timeline/comparison features currently listed only as roadmap items.
 
 ## 7. Next-Agent Checklist
@@ -433,6 +437,7 @@ Verified current automated coverage:
   - SQLite session round-trip test
   - batch replacement persistence test
   - delete cascade persistence test
+  - legacy unversioned database migration-preservation test
 - `tracescope-app`
   - no tests
 - `tracescope-ui`
