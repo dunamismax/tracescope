@@ -384,7 +384,7 @@ mod tests {
         SpanId, SpanLevel, Task, TaskId, TaskState, TaskStats,
     };
 
-    use super::{SessionDraft, SessionStore};
+    use super::{as_sql_id, SessionDraft, SessionStore};
 
     #[test]
     fn session_round_trip_works() {
@@ -469,5 +469,140 @@ mod tests {
 
         store.delete_session(session_id).expect("delete session");
         assert!(store.list_sessions().expect("list after delete").is_empty());
+    }
+
+    #[test]
+    fn saving_a_batch_replaces_previous_rows_for_the_same_session() {
+        let temp = tempdir().expect("tempdir");
+        let store = SessionStore::open_in_dir(temp.path()).expect("store");
+        let started_at = Utc::now();
+
+        let session_id = store
+            .create_session(&SessionDraft {
+                name: "replace batch".to_string(),
+                target_address: "http://127.0.0.1:6669".to_string(),
+                started_at,
+                ended_at: None,
+                metadata: BTreeMap::new(),
+            })
+            .expect("create session");
+
+        let original_task = Task {
+            id: TaskId(1),
+            name: "first".to_string(),
+            state: TaskState::Idle,
+            fields: BTreeMap::new(),
+            stats: TaskStats::default(),
+            warnings: Vec::new(),
+            created_at: Some(started_at),
+            dropped_at: None,
+        };
+        let replacement_task = Task {
+            id: TaskId(2),
+            name: "second".to_string(),
+            state: TaskState::Running,
+            fields: BTreeMap::new(),
+            stats: TaskStats {
+                poll_count: 3,
+                ..TaskStats::default()
+            },
+            warnings: Vec::new(),
+            created_at: Some(started_at),
+            dropped_at: None,
+        };
+
+        store
+            .save_task_batch(session_id, &[original_task])
+            .expect("save original batch");
+        store
+            .save_task_batch(session_id, std::slice::from_ref(&replacement_task))
+            .expect("save replacement batch");
+
+        let loaded = store.load_session(session_id).expect("load session");
+        assert_eq!(loaded.tasks, vec![replacement_task]);
+
+        let connection = store.connection().expect("connection");
+        let task_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE session_id = ?1",
+                [as_sql_id(session_id).expect("session id")],
+                |row| row.get(0),
+            )
+            .expect("task count");
+        assert_eq!(task_count, 1);
+    }
+
+    #[test]
+    fn deleting_a_session_cascades_to_related_rows() {
+        let temp = tempdir().expect("tempdir");
+        let store = SessionStore::open_in_dir(temp.path()).expect("store");
+        let started_at = Utc::now();
+        let ended_at = started_at + Duration::seconds(1);
+
+        let session_id = store
+            .create_session(&SessionDraft {
+                name: "cascade delete".to_string(),
+                target_address: "http://127.0.0.1:6669".to_string(),
+                started_at,
+                ended_at: Some(ended_at),
+                metadata: BTreeMap::new(),
+            })
+            .expect("create session");
+
+        store
+            .save_task_batch(
+                session_id,
+                &[Task {
+                    id: TaskId(9),
+                    name: "task".to_string(),
+                    state: TaskState::Done,
+                    fields: BTreeMap::new(),
+                    stats: TaskStats::default(),
+                    warnings: Vec::new(),
+                    created_at: Some(started_at),
+                    dropped_at: Some(ended_at),
+                }],
+            )
+            .expect("save tasks");
+        store
+            .save_span_batch(
+                session_id,
+                &[Span {
+                    id: SpanId(4),
+                    parent_id: None,
+                    name: "span".to_string(),
+                    target: "demo".to_string(),
+                    level: SpanLevel::Info,
+                    fields: BTreeMap::new(),
+                    entered_at: Some(started_at),
+                    exited_at: Some(ended_at),
+                    busy_duration: DurationValue::from_millis(10),
+                }],
+            )
+            .expect("save spans");
+        store
+            .save_resource_batch(
+                session_id,
+                &[Resource {
+                    id: ResourceId(5),
+                    kind: "timer".to_string(),
+                    name: "interval".to_string(),
+                    stats: ResourceStats::default(),
+                    visibility: ResourceVisibility::Visible,
+                }],
+            )
+            .expect("save resources");
+
+        store.delete_session(session_id).expect("delete session");
+
+        let connection = store.connection().expect("connection");
+        for table in ["tasks", "spans", "resources"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count");
+            assert_eq!(count, 0, "{table} rows should be deleted");
+        }
     }
 }

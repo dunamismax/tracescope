@@ -16,3 +16,4 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracescope-core = { path = "../tracescope-core" }
 tracescope-ui = { path = "../tracescope-ui" }
+wgpu.workspace = true

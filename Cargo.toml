@@ -37,4 +37,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 tonic = { version = "0.14.5", features = ["transport"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-
+wgpu = { version = "27.0.1", default-features = false, features = ["std", "dx12", "gles", "metal", "vulkan", "wgsl"] }

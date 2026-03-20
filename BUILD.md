@@ -7,7 +7,7 @@ This file is a **living document**. Every future agent or developer working in t
 If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
 
 Reviewed on: 2026-03-20
-Reviewed from commit: `54e8b163dc8ba011213666902e7f7ee9f6ebbe8e`
+Reviewed from commit: `54e8b163dc8ba011213666902e7f7ee9f6ebbe8e` plus working-tree updates applied during this pass
 Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`
 
 ## 1. Project Baseline
@@ -21,13 +21,13 @@ TraceScope is a Rust workspace for a native desktop async telemetry viewer:
 - It can persist the current snapshot to SQLite and later reload it into the UI.
 - It ships with a demo Tokio server for local telemetry generation.
 
-Important limitation: the current desktop binary does not launch successfully on the reviewed macOS environment. See Known Issues.
-
 ### Major components, services, modules, and entry points
 
 - Workspace root: `Cargo.toml`
   - Declares the four workspace members and shared dependency versions.
   - Pins `rust-version = "1.81"`.
+- Workspace Cargo config: `.cargo/config.toml`
+  - Injects `--cfg tokio_unstable` for all cargo builds in this repo.
 - Desktop binary: `crates/tracescope-app/src/main.rs`
   - CLI entry point.
   - Creates the `eframe` app.
@@ -60,7 +60,7 @@ Implemented and visible in code:
   - `Trace.watch()` span activity when the server supports it.
   - Fallback behavior when the trace stream is unimplemented.
 
-Not implemented despite broader product wording in `README.md`:
+Not implemented yet:
 
 - Session comparison and diffing.
 - Full replay/time-travel playback.
@@ -91,12 +91,12 @@ Likely platform requirements, not fully verified here:
 - CLI flags:
   - `--target <TARGET>` defaults to `127.0.0.1:6669` and is normalized to `http://...`
   - `--data-dir <DATA_DIR>` overrides the persistence directory
+- Workspace cargo config:
+  - `.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]`
+  - This makes both `cargo run -p demo-server` and `cd examples/demo-server && cargo run` work without extra shell setup
 - Optional logging:
   - `tracing_subscriber` honors `RUST_LOG`
   - Fallback filter in code is `info,tracescope_core=debug,tracescope_app=debug`
-- Demo server special case:
-  - `examples/demo-server/.cargo/config.toml` injects `--cfg tokio_unstable`
-  - That config only applies when Cargo is invoked from `examples/demo-server/`
 
 ### Verified commands
 
@@ -107,13 +107,13 @@ These commands were run successfully during this review unless marked as a verif
 | `cargo metadata --format-version 1 --no-deps` | Success | Confirms a 4-package workspace. |
 | `cargo fmt --all -- --check` | Success | Formatting is clean. |
 | `cargo build --workspace` | Success | All workspace members build. |
-| `cargo test --workspace` | Success | 3 tests pass, all in `tracescope-core`. |
+| `cargo test --workspace` | Success | 5 tests pass, all in `tracescope-core`. |
 | `cargo clippy --workspace --all-targets -- -D warnings` | Success | No warnings under current code. |
 | `cargo run -p tracescope-app -- --help` | Success | CLI parsing works and prints options. |
-| `cd examples/demo-server && cargo run` | Success | Process stayed running after startup window; no panic observed. |
-| `RUSTFLAGS='--cfg tokio_unstable' cargo run -p demo-server` | Success | Workspace-root way to run the demo server. |
-| `cargo run -p demo-server` | Verified failure | Panics at runtime because Tokio was not built with `--cfg tokio_unstable`. |
-| `cargo run -p tracescope-app` | Verified failure on reviewed macOS environment | Aborts in `wgpu` during app launch; see Known Issues. |
+| `cargo run -p demo-server` | Success | Process stayed running from the workspace root; no `tokio_unstable` panic. |
+| `cd examples/demo-server && cargo run` | Success | Process stayed running after startup. |
+| `cargo run -p tracescope-app` | Success | Desktop window launch smoke-tested on reviewed macOS machine; no `wgpu` backend panic. |
+| `cargo run -p tracescope-app -- --target http://127.0.0.1:6669` | Success | Launch smoke test stayed running against the default demo target. |
 
 ### Exact commands to use now
 
@@ -121,21 +121,28 @@ Recommended safe workflow from the current repo state:
 
 ```bash
 cargo fmt --all -- --check
+cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Run the demo server from its example directory:
+Run the demo server from the repository root:
+
+```bash
+cargo run -p demo-server
+```
+
+The example-directory command works too:
 
 ```bash
 cd examples/demo-server
 cargo run
 ```
 
-Alternative workspace-root demo-server command:
+Launch the desktop app:
 
 ```bash
-RUSTFLAGS='--cfg tokio_unstable' cargo run -p demo-server
+cargo run -p tracescope-app -- --target http://127.0.0.1:6669
 ```
 
 Inspect the app CLI without launching the GUI:
@@ -144,14 +151,12 @@ Inspect the app CLI without launching the GUI:
 cargo run -p tracescope-app -- --help
 ```
 
-### Unverified but likely commands
+### Unverified but likely workflows
 
-These were not verified end-to-end as successful product workflows:
+These were not fully verified end-to-end in this pass:
 
-- `cargo run -p tracescope-app -- --target http://127.0.0.1:6669`
-  - Likely intended launch command once the desktop backend issue is fixed.
 - `cargo run -p tracescope-app -- --data-dir /custom/path`
-  - CLI flag exists; not manually validated against a working GUI launch.
+  - CLI flag exists; not manually validated beyond launch behavior.
 - End-to-end interactive flow:
   - start demo server
   - launch app
@@ -177,6 +182,8 @@ There are no repo-provided commands for:
   - Primary operational handoff document.
 - `Cargo.toml`
   - Workspace membership, Rust version, dependency versions, and UI feature flags.
+- `.cargo/config.toml`
+  - Canonical place where repo-wide `tokio_unstable` is configured.
 - `Cargo.lock`
   - Exact dependency resolution currently used by the repo.
 - `crates/tracescope-core/src/model.rs`
@@ -187,24 +194,19 @@ There are no repo-provided commands for:
   - Canonical description of what live telemetry is actually collected and how warnings/states are derived.
 - `crates/tracescope-ui/src/app.rs`
   - Canonical description of what user actions the UI currently supports.
-- `examples/demo-server/.cargo/config.toml`
-  - Canonical place where `tokio_unstable` is configured today.
 
 ### Documentation quality and conflicts
 
-- `README.md` is useful for a quick overview, but it is not fully current operationally.
-  - Its Quick Start only works for the demo server because it changes into `examples/demo-server/` before running Cargo.
-  - It does not mention that `cargo run -p demo-server` from the workspace root fails unless `RUSTFLAGS='--cfg tokio_unstable'` is provided.
-  - It describes the product as `connect, record, replay, compare`, but compare is not implemented and replay is currently limited to reloading a final saved snapshot.
-- `AGENTS.md` contains compact project memory for Codex and future agents, but `BUILD.md` should supersede it for handoff and build/run guidance.
+- `README.md` and `AGENTS.md` were reconciled in this pass to match current behavior.
+- `BUILD.md` still remains the operational source of truth because it tracks verified commands, gaps, and next-pass work in more detail than the shorter docs.
 
 ### Important configuration details
 
 - `Cargo.toml`
   - `eframe = { default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }`
-  - This is the most important current build-risk line for desktop launch behavior.
-- `examples/demo-server/.cargo/config.toml`
-  - Contains the only in-repo `tokio_unstable` configuration.
+  - The app crate now also depends directly on `wgpu` with native backend features enabled (`dx12`, `gles`, `metal`, `vulkan`, `wgsl`) so the reviewed macOS launch path has a usable backend.
+- `.cargo/config.toml`
+  - Applies `tokio_unstable` repo-wide, removing the working-directory trap for the demo server.
 - `crates/tracescope-app/src/main.rs`
   - Defaults persistence to `~/.tracescope`
   - Defaults the connection target to `127.0.0.1:6669`
@@ -214,23 +216,19 @@ There are no repo-provided commands for:
 
 ## 4. Current Gaps And Known Issues
 
-### Verified issues
+### Verified remaining issues
 
-1. `cargo run -p tracescope-app` fails on the reviewed macOS environment.
-   - Observed failure: `wgpu` panics during startup with `No wgpu backend feature that is implemented for the target platform was enabled`.
-   - Most likely cause: the `eframe` feature set in `Cargo.toml` is configured for `wgpu` plus Linux window-system features (`x11`, `wayland`) but does not enable a macOS-capable backend feature set.
-   - Impact: the primary desktop app cannot currently be manually exercised on this machine.
+1. The full interactive manual loop is still not verified end-to-end.
+   - App launch was smoke-tested successfully.
+   - Demo-server launch was verified successfully.
+   - Connect, record, save, reload, and delete were not driven through the GUI in this pass.
 
-2. `cargo run -p demo-server` from the workspace root fails unless `tokio_unstable` is set externally.
-   - Observed failure: `console-subscriber` panics and demands `RUSTFLAGS="--cfg tokio_unstable"`.
-   - Cause: the needed rustflags are only configured in `examples/demo-server/.cargo/config.toml`.
-   - Impact: root-level demo commands are easy to get wrong and the current `README.md` does not spell out the root-level failure mode.
+2. Recording is still snapshot-based, not event-log-based.
+   - `persist_recording` saves the latest task/span/resource state at stop time.
+   - There is no time-travel replay engine yet.
 
 ### Codebase/product gaps visible in code
 
-- Recording is snapshot-based, not event-log-based.
-  - `persist_recording` saves the current task/span/resource batches at stop time.
-  - There is no full timeline replay engine.
 - Timeline is Phase-1 only.
   - Current UI renders proportional span bars without swimlanes, zoom, pan, or trace navigation.
 - Session comparison/diffing is absent.
@@ -241,43 +239,31 @@ There are no repo-provided commands for:
 
 ### Risk areas
 
-- Cross-platform desktop launch behavior is fragile until the `eframe`/`wgpu` feature selection is corrected and tested on target OSes.
-- The operator experience for local manual testing is brittle because demo-server invocation differs by working directory.
+- Cross-platform desktop launch behavior needs broader validation on Linux and Windows even though the reviewed macOS launch path is fixed.
+- Repo-wide `tokio_unstable` is convenient for local development, but it is still a global build setting that should be kept in mind if new crates are added later.
 - Schema evolution will be risky once persisted session data matters, because the DB schema is created inline with no migration layer.
 
 ## 5. Next-Pass Priorities
 
 ### Highest impact, in dependency order
 
-1. Fix desktop launch on macOS.
-   - Start with `Cargo.toml` feature selection for `eframe`/`wgpu`.
-   - Re-verify `cargo run -p tracescope-app` before doing any UI feature work.
-
-2. Normalize the demo-server workflow.
-   - Make root-level invocation safe, or document a single blessed command everywhere.
-   - Prefer removing the working-directory trap around `tokio_unstable`.
-
-3. Re-establish a real manual test loop.
+1. Re-establish a real manual test loop.
    - Demo server starts.
    - App launches.
    - App connects to `127.0.0.1:6669`.
    - Recording saves to SQLite.
    - Session load/delete works.
 
-4. Reconcile stale docs.
-   - Update `README.md` and `AGENTS.md` after `BUILD.md` is in place.
-   - Remove or soften claims around compare/replay until those features exist.
-
-5. Add tests where current risk is highest.
+2. Add tests where current risk is highest.
    - Collector-state transformation tests.
-   - Persistence-flow tests beyond a single round-trip.
+   - UI/session-flow tests if practical.
    - If practical, a small integration test for demo-server compatibility.
 
-### Quick wins
+3. Introduce migrations before evolving `sessions.db`.
+   - The inline schema creation is fine for now but will get risky as persisted data becomes more important.
 
-- Add a workspace-level `.cargo/config.toml` or another root-safe mechanism for `tokio_unstable`.
-- Document the macOS launch failure plainly until it is fixed.
-- Add a short “known good local commands” section to `README.md` after the launch issues are resolved.
+4. Upgrade the recording model.
+   - Move from snapshot-only persistence toward an event-log or timeline-oriented session format.
 
 ### Deeper refactors
 
@@ -296,24 +282,25 @@ Use this in order after opening the repo:
 
 ```bash
 cargo fmt --all -- --check
+cargo build --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-5. For demo-server work, use one of these exact commands:
+5. For demo-server work, use either of these exact commands:
 
 ```bash
-cd examples/demo-server && cargo run
+cargo run -p demo-server
 ```
 
 or
 
 ```bash
-RUSTFLAGS='--cfg tokio_unstable' cargo run -p demo-server
+cd examples/demo-server && cargo run
 ```
 
-6. Do not assume `cargo run -p tracescope-app` works on macOS yet. Re-test it explicitly after any dependency or windowing change.
-7. If your goal is feature work, fix the app launch issue first so you have a usable manual validation loop.
+6. Re-test `cargo run -p tracescope-app` after any dependency or windowing change. It is working on the reviewed macOS environment now, but this remains a sensitive path.
+7. If your goal is UI feature work, re-run the manual loop early so you do not stack changes on top of an unverified app path.
 8. If you change persistence, update both:
    - `crates/tracescope-core/src/model.rs`
    - `crates/tracescope-core/src/store.rs`
@@ -327,6 +314,8 @@ Verified current automated coverage:
   - duration arithmetic test
   - warning derivation test
   - SQLite session round-trip test
+  - batch replacement persistence test
+  - delete cascade persistence test
 - `tracescope-app`
   - no tests
 - `tracescope-ui`
