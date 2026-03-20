@@ -9,6 +9,14 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
     ui.heading("Sessions");
     ui.label("Browse saved sessions and control recording.");
     ui.add_space(8.0);
+    ui.label(match app.recording_blocked_reason() {
+        Some(reason) if app.recording.is_none() => format!("Recording unavailable: {reason}"),
+        _ if app.recording.is_some() => {
+            String::from("Recording a live snapshot for the current connection.")
+        }
+        _ => String::from("Recording is available while connected to live telemetry."),
+    });
+    ui.add_space(8.0);
 
     ui.horizontal(|ui| {
         let is_recording = app.recording.is_some();
@@ -17,23 +25,30 @@ pub fn render(ui: &mut egui::Ui, app: &mut TraceScopeApp) {
         } else {
             "Start Recording"
         };
-        if ui.button(button_label).clicked() {
-            if is_recording {
-                app.stop_recording();
-            } else {
-                app.start_recording();
-            }
-        }
+        ui.add_enabled_ui(
+            app.recording.is_some() || app.recording_blocked_reason().is_none(),
+            |ui| {
+                if ui.button(button_label).clicked() {
+                    if is_recording {
+                        app.stop_recording();
+                    } else {
+                        app.start_recording();
+                    }
+                }
+            },
+        );
 
         if ui.button("Refresh").clicked() {
             app.refresh_sessions();
         }
-        if ui.button("Load Selected").clicked() {
-            app.load_selected_session();
-        }
-        if ui.button("Delete Selected").clicked() {
-            app.delete_selected_session();
-        }
+        ui.add_enabled_ui(app.recording.is_none(), |ui| {
+            if ui.button("Load Selected").clicked() {
+                app.load_selected_session();
+            }
+            if ui.button("Delete Selected").clicked() {
+                app.delete_selected_session();
+            }
+        });
     });
 
     ui.add_space(8.0);

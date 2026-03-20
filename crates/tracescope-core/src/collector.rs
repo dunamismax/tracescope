@@ -268,14 +268,19 @@ struct MetadataCatalog {
 }
 
 impl MetadataCatalog {
-    fn insert_batch(&mut self, metadata: Option<RegisterMetadata>) {
+    fn insert_batch(&mut self, metadata: Option<RegisterMetadata>) -> Vec<u64> {
+        let mut inserted = Vec::new();
+
         if let Some(metadata) = metadata {
             for entry in metadata.metadata {
                 if let (Some(id), Some(payload)) = (entry.id, entry.metadata) {
+                    inserted.push(id.id);
                     self.entries.insert(id.id, payload);
                 }
             }
         }
+
+        inserted
     }
 
     fn get(&self, meta_id: Option<MetaId>) -> Option<&Metadata> {
@@ -289,6 +294,7 @@ struct CollectorState {
     metadata: MetadataCatalog,
     tasks: HashMap<TaskId, Task>,
     spans: HashMap<SpanId, Span>,
+    span_metadata_ids: HashMap<SpanId, u64>,
     resources: HashMap<ResourceId, Resource>,
     active_spans: HashMap<SpanId, DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
@@ -301,6 +307,7 @@ impl CollectorState {
             metadata: MetadataCatalog::default(),
             tasks: HashMap::new(),
             spans: HashMap::new(),
+            span_metadata_ids: HashMap::new(),
             resources: HashMap::new(),
             active_spans: HashMap::new(),
             updated_at: None,
@@ -308,8 +315,9 @@ impl CollectorState {
     }
 
     fn apply_update(&mut self, update: Update) {
-        self.updated_at = timestamp_to_datetime(update.now);
-        self.metadata.insert_batch(update.new_metadata);
+        self.observe_timestamp(timestamp_to_datetime(update.now));
+        let updated_metadata = self.metadata.insert_batch(update.new_metadata);
+        self.hydrate_spans_for_metadata(&updated_metadata);
 
         if let Some(task_update) = update.task_update {
             self.apply_task_update(task_update);
@@ -324,11 +332,15 @@ impl CollectorState {
         use trace::trace_event::Event;
 
         match event.event {
-            Some(Event::RegisterMetadata(metadata)) => self.metadata.insert_batch(Some(metadata)),
+            Some(Event::RegisterMetadata(metadata)) => {
+                let updated_metadata = self.metadata.insert_batch(Some(metadata));
+                self.hydrate_spans_for_metadata(&updated_metadata);
+            }
             Some(Event::NewSpan(span)) => self.register_span(span),
             Some(Event::EnterSpan(enter)) => {
                 if let (Some(span_id), Some(at)) = (enter.span_id, timestamp_to_datetime(enter.at))
                 {
+                    self.observe_timestamp(Some(at));
                     let span_id = SpanId(span_id.id);
                     let span = self.spans.entry(span_id).or_insert_with(|| Span {
                         id: span_id,
@@ -347,6 +359,7 @@ impl CollectorState {
             }
             Some(Event::ExitSpan(exit)) => {
                 if let (Some(span_id), Some(at)) = (exit.span_id, timestamp_to_datetime(exit.at)) {
+                    self.observe_timestamp(Some(at));
                     let span_id = SpanId(span_id.id);
                     if let Some(span) = self.spans.get_mut(&span_id) {
                         span.exited_at = Some(at);
@@ -361,6 +374,7 @@ impl CollectorState {
             Some(Event::CloseSpan(close)) => {
                 if let (Some(span_id), Some(at)) = (close.span_id, timestamp_to_datetime(close.at))
                 {
+                    self.observe_timestamp(Some(at));
                     let span_id = SpanId(span_id.id);
                     if let Some(span) = self.spans.get_mut(&span_id) {
                         span.exited_at = Some(at);
@@ -515,28 +529,47 @@ impl CollectorState {
             return;
         };
 
-        let metadata = self.metadata.get(span.metadata_id);
-        let entry = self.spans.entry(id).or_insert_with(|| Span {
-            id,
-            parent_id: None,
-            name: metadata
-                .map(|value| value.name.clone())
-                .unwrap_or_else(|| format!("span-{}", id.0)),
-            target: metadata
-                .map(|value| value.target.clone())
-                .unwrap_or_else(|| String::from("unknown")),
-            level: metadata
-                .map(level_from_metadata)
-                .unwrap_or_else(|| SpanLevel::Unknown(String::from("unknown"))),
-            fields: decode_fields(metadata, &span.fields),
-            entered_at: timestamp_to_datetime(span.at),
-            exited_at: None,
-            busy_duration: DurationValue::default(),
-        });
+        let observed_at = timestamp_to_datetime(span.at);
+        self.observe_timestamp(observed_at);
+        let metadata_id = span.metadata_id.map(|value| value.id);
+        let metadata = metadata_id.and_then(|meta_id| self.metadata.entries.get(&meta_id).cloned());
 
-        entry.fields = decode_fields(metadata, &span.fields);
-        if entry.entered_at.is_none() {
-            entry.entered_at = timestamp_to_datetime(span.at);
+        if let Some(metadata_id) = metadata_id {
+            self.span_metadata_ids.insert(id, metadata_id);
+        }
+
+        let entry = self
+            .spans
+            .entry(id)
+            .or_insert_with(|| placeholder_span(id, observed_at));
+        hydrate_span(entry, metadata.as_ref(), &span.fields, observed_at);
+    }
+
+    fn hydrate_spans_for_metadata(&mut self, metadata_ids: &[u64]) {
+        if metadata_ids.is_empty() {
+            return;
+        }
+
+        for (span_id, span) in &mut self.spans {
+            let Some(metadata_id) = self.span_metadata_ids.get(span_id) else {
+                continue;
+            };
+            if !metadata_ids.contains(metadata_id) {
+                continue;
+            }
+
+            if let Some(metadata) = self.metadata.entries.get(metadata_id) {
+                hydrate_span_metadata(span, metadata);
+            }
+        }
+    }
+
+    fn observe_timestamp(&mut self, observed_at: Option<DateTime<Utc>>) {
+        if let Some(observed_at) = observed_at {
+            self.updated_at = Some(
+                self.updated_at
+                    .map_or(observed_at, |current| current.max(observed_at)),
+            );
         }
     }
 
@@ -602,6 +635,45 @@ fn duration_between(started_at: DateTime<Utc>, ended_at: DateTime<Utc>) -> Durat
         .num_microseconds()
         .unwrap_or_default();
     DurationValue::from_micros(u64::try_from(micros.max(0)).unwrap_or_default())
+}
+
+fn placeholder_span(id: SpanId, entered_at: Option<DateTime<Utc>>) -> Span {
+    Span {
+        id,
+        parent_id: None,
+        name: format!("span-{}", id.0),
+        target: String::from("unknown"),
+        level: SpanLevel::Unknown(String::from("unknown")),
+        fields: BTreeMap::new(),
+        entered_at,
+        exited_at: None,
+        busy_duration: DurationValue::default(),
+    }
+}
+
+fn hydrate_span(
+    span: &mut Span,
+    metadata: Option<&Metadata>,
+    fields: &[Field],
+    observed_at: Option<DateTime<Utc>>,
+) {
+    if let Some(metadata) = metadata {
+        hydrate_span_metadata(span, metadata);
+    }
+
+    span.fields = decode_fields(metadata, fields);
+    span.entered_at = match (span.entered_at, observed_at) {
+        (Some(existing), Some(observed_at)) => Some(existing.min(observed_at)),
+        (None, Some(observed_at)) => Some(observed_at),
+        (Some(existing), None) => Some(existing),
+        (None, None) => None,
+    };
+}
+
+fn hydrate_span_metadata(span: &mut Span, metadata: &Metadata) {
+    span.name = metadata.name.clone();
+    span.target = metadata.target.clone();
+    span.level = level_from_metadata(metadata);
 }
 
 fn decode_fields(metadata: Option<&Metadata>, fields: &[Field]) -> BTreeMap<String, FieldValue> {
@@ -711,8 +783,8 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
 
     use console_api::{
-        instrument::Update, metadata, register_metadata, resources, tasks, trace, Id, MetaId,
-        Metadata, PollStats, RegisterMetadata, Span as ApiSpan,
+        field, instrument::Update, metadata, register_metadata, resources, tasks, trace, Field, Id,
+        MetaId, Metadata, PollStats, RegisterMetadata, Span as ApiSpan,
     };
     use proptest::{collection::vec, prelude::*};
 
@@ -815,6 +887,57 @@ mod tests {
         );
         assert_eq!(snapshot.warnings.len(), 3);
         assert_eq!(snapshot.warnings[0].task_id, TaskId(3));
+    }
+
+    #[test]
+    fn late_span_registration_hydrates_placeholder_metadata() {
+        let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+
+        state.apply_trace_event(trace::TraceEvent {
+            event: Some(trace::trace_event::Event::RegisterMetadata(
+                register_metadata(7, "worker", "demo"),
+            )),
+        });
+        state.apply_trace_event(enter_span_event(1, 5));
+        state.apply_trace_event(trace::TraceEvent {
+            event: Some(trace::trace_event::Event::NewSpan(ApiSpan {
+                id: span_id(1),
+                metadata_id: meta_id(7),
+                fields: vec![Field {
+                    name: Some(field::Name::StrName(String::from("task"))),
+                    value: Some(field::Value::StrVal(String::from("alpha"))),
+                    ..Default::default()
+                }],
+                at: timestamp(10),
+            })),
+        });
+
+        let span = state.spans.get(&SpanId(1)).expect("span recorded");
+
+        assert_eq!(span.name, "worker");
+        assert_eq!(span.target, "demo");
+        assert_eq!(span.level, SpanLevel::Info);
+        assert_eq!(
+            span.fields.get("task"),
+            Some(&FieldValue::String(String::from("alpha")))
+        );
+        assert_eq!(span.entered_at, timestamp_to_datetime(timestamp(5)));
+    }
+
+    #[test]
+    fn trace_only_activity_advances_updated_at() {
+        let mut state = CollectorState::new(String::from("http://127.0.0.1:6669"));
+
+        state.apply_trace_event(enter_span_event(1, 25));
+        assert_eq!(state.updated_at, timestamp_to_datetime(timestamp(25)));
+
+        state.apply_trace_event(close_span_event(1, 40));
+
+        assert_eq!(state.updated_at, timestamp_to_datetime(timestamp(40)));
+        assert_eq!(
+            state.snapshot().updated_at,
+            timestamp_to_datetime(timestamp(40))
+        );
     }
 
     proptest! {

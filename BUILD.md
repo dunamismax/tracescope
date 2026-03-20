@@ -354,6 +354,82 @@ No medium-severity findings remain from this pass.
 5. **Collector and UI integration coverage is still absent.**
    - Automated coverage remains concentrated in `tracescope-core`. The highest-risk flows still need tests around collector state transitions and session interactions.
 
+### Code Review Addendum (2026-03-20, independent follow-up review)
+
+Local re-checks for this addendum passed:
+
+- `cargo fmt --all -- --check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `cargo nextest run --workspace`
+- `cargo deny check` (still reports duplicate-version warnings, but policy is intentionally `warn`)
+
+Strengths confirmed in the current codebase:
+
+- The crate split is clean and sensible: `tracescope-core` holds the model/collector/store logic, `tracescope-ui` is mostly presentation, and `tracescope-app` is thin wiring.
+- Persistence is in a materially better place than a typical early-stage desktop tool: WAL mode, foreign keys, transactional snapshot saves, and explicit schema migrations are all in place.
+- Repo hygiene is solid for a work-in-progress desktop app: CI runs fmt/build/clippy/test/nextest/deny on Ubuntu and cross-platform build smoke tests on macOS/Windows.
+- Documentation quality is high. `BUILD.md` and `README.md` accurately describe the current product shape and known limits.
+
+Additional findings from this review:
+
+### Severity: Medium
+
+1. **"Recording" is not gated on a live connection and can silently re-save stale or replayed data** (`crates/tracescope-ui/src/app.rs`)
+   - `start_recording()` only captures a timestamp, and `stop_recording()` always persists the current in-memory snapshot.
+   - There is no check that the app is currently connected, receiving live telemetry, or not browsing a previously loaded session.
+   - In practice, a user can hit record while disconnected or while viewing a loaded session and create a new saved session that is just a copy of old data. That is a product-semantics bug, not just a missing feature.
+
+2. **The collector ships full cloned snapshots over an unbounded channel on every update event** (`crates/tracescope-app/src/main.rs`, `crates/tracescope-core/src/collector.rs`, `crates/tracescope-ui/src/app.rs`)
+   - The app uses `std::sync::mpsc::channel()`, which is unbounded.
+   - The collector calls `state.snapshot()` after each instrument update and each trace event, cloning all tasks, spans, resources, and warnings every time.
+   - On noisy targets, this can turn into avoidable allocation churn and queue growth if the UI falls behind. Architecturally, this is the biggest scale risk currently visible in the code.
+
+### Severity: Low
+
+3. **Placeholder spans are only partially hydrated if an enter event is seen before full span registration** (`crates/tracescope-core/src/collector.rs`)
+   - `EnterSpan` creates a fallback span with `name = span-<id>`, `target = "unknown"`, and a default level.
+   - Later `register_span()` updates fields and `entered_at`, but it does not backfill `name`, `target`, or `level` for an already-created placeholder.
+   - If event ordering ever produces enter-before-register, the UI can keep degraded span metadata indefinitely.
+
+4. **`updated_at` reflects instrument updates, not trace-only activity** (`crates/tracescope-core/src/collector.rs`)
+   - `updated_at` is advanced in `apply_update()` from `Update.now`, but `apply_trace_event()` does not update it.
+   - If the trace stream is active while task/resource updates are quiet, the connection view's "Last update" timestamp can lag behind actual incoming span activity.
+
+### Coverage / maintenance notes
+
+5. **The highest-risk user flows still have no automated coverage**
+   - `tracescope-app`, `tracescope-ui`, and `examples/demo-server` still have zero tests.
+   - CI proves the desktop code compiles on macOS/Windows, but it does not exercise a launch smoke test or any connect/record/load/delete interaction.
+   - Given the amount of behavior living in `TraceScopeApp`, this is now the main quality-gap after the core-store work.
+
+Recommended next steps from this addendum:
+
+1. Gate recording behind a live connection, or rename the action so snapshot export and live recording are clearly distinct.
+2. Replace the unbounded full-snapshot push model with either a bounded/coalescing channel or a shared-state pull model from the UI.
+3. Add regression coverage for app-level session behavior and for the collector's span-registration ordering edge case.
+4. Add at least one desktop startup smoke test path beyond compile-only CI, even if it remains lightweight.
+
+### Implementation Follow-Up (2026-03-20, recording gate and span hydration)
+
+Changed in this pass:
+
+- `tracescope-ui` now gates recording on a live collector connection, surfaces the blocked reason in the sessions view and status bar, prevents loading/deleting sessions mid-recording, and cancels an active recording if the live connection drops.
+- `tracescope-core` now hydrates placeholder spans when later span registration metadata arrives, tracks span metadata IDs so late metadata batches can backfill existing spans, and advances `updated_at` from trace-only span activity.
+- Added focused regression coverage in `tracescope-ui` for disconnected/session-loaded recording behavior and in `tracescope-core` for late span registration and trace-driven `updated_at`.
+
+Verified in this pass:
+
+- `cargo fmt --all -- --check`
+- `cargo test -p tracescope-core -p tracescope-ui`
+- `cargo clippy -p tracescope-core -p tracescope-ui --all-targets -- -D warnings`
+
+Still remaining:
+
+- Recording is still snapshot-based rather than an event log.
+- Session browsing still lacks end-to-end UI smoke coverage.
+- The unbounded full-snapshot channel remains the main scaling risk called out in this review addendum.
+
 ## 6. Next-Pass Priorities
 
 ### Highest impact, in dependency order

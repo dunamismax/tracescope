@@ -3763,6 +3763,7 @@ dependencies = [
  "egui",
  "egui_extras",
  "serde",
+ "tempfile",
  "tracescope-core",
 ]
 

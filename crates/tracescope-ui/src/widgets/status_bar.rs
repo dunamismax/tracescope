@@ -9,11 +9,7 @@ pub fn render(ui: &mut egui::Ui, app: &TraceScopeApp) {
     ui.horizontal_wrapped(|ui| {
         ui.label(app.connection_label());
         ui.separator();
-        ui.label(if app.recording.is_some() {
-            "Recording: on"
-        } else {
-            "Recording: off"
-        });
+        ui.label(app.recording_status_label());
         ui.separator();
         ui.label(format!(
             "Tasks: {}  Spans: {}  Resources: {}",

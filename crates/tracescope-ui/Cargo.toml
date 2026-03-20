@@ -12,3 +12,6 @@ egui.workspace = true
 egui_extras.workspace = true
 serde.workspace = true
 tracescope-core = { path = "../tracescope-core" }
+
+[dev-dependencies]
+tempfile.workspace = true
