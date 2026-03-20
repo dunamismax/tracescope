@@ -4,7 +4,7 @@ This is the primary operational handoff document for this repository.
 
 This file is a **living document**. Every future agent or developer working in this repo is responsible for keeping it accurate, current, and up to date. If behavior, commands, tooling, risks, or repo structure change, update this file in the same pass.
 
-If `BUILD.md`, `README.md`, and `CLAUDE.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
+If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
 
 Reviewed on: 2026-03-20
 Reviewed from commit: `54e8b163dc8ba011213666902e7f7ee9f6ebbe8e`
@@ -196,7 +196,7 @@ There are no repo-provided commands for:
   - Its Quick Start only works for the demo server because it changes into `examples/demo-server/` before running Cargo.
   - It does not mention that `cargo run -p demo-server` from the workspace root fails unless `RUSTFLAGS='--cfg tokio_unstable'` is provided.
   - It describes the product as `connect, record, replay, compare`, but compare is not implemented and replay is currently limited to reloading a final saved snapshot.
-- `CLAUDE.md` contains useful historical project memory, but `BUILD.md` should supersede it for future handoff and build/run guidance.
+- `AGENTS.md` contains compact project memory for Codex and future agents, but `BUILD.md` should supersede it for handoff and build/run guidance.
 
 ### Important configuration details
 
@@ -265,7 +265,7 @@ There are no repo-provided commands for:
    - Session load/delete works.
 
 4. Reconcile stale docs.
-   - Update `README.md` and `CLAUDE.md` after `BUILD.md` is in place.
+   - Update `README.md` and `AGENTS.md` after `BUILD.md` is in place.
    - Remove or soften claims around compare/replay until those features exist.
 
 5. Add tests where current risk is highest.

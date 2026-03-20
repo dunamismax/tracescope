@@ -1,4 +1,10 @@
-# TraceScope Memory
+# TraceScope Agent Notes
+
+This file replaces the old `CLAUDE.md` and is intended for Codex and any future
+AI agent or developer working in this repository.
+
+For the primary operational handoff, read `BUILD.md` first. Use this file as
+compact project memory and orientation context.
 
 ## Purpose
 
@@ -52,8 +58,6 @@ recorded snapshots to SQLite for replay in the UI.
 ## Current Development State
 
 - Workspace and member crates are fully scaffolded.
-- `examples/demo-server` compiles and was manually verified on March 19, 2026
-  to listen on `127.0.0.1:6669`.
 - `tracescope-core` includes:
   - Session/task/span/resource model types
   - Warning derivation for long polls and self-wakes
@@ -69,10 +73,8 @@ recorded snapshots to SQLite for replay in the UI.
   - tracing initialization
   - background Tokio runtime manager thread
   - collector command/event channel wiring
-- Verification completed:
-  - `cargo fmt --all --check`
-  - `cargo test --workspace`
-  - `cargo clippy --workspace --all-targets -- -D warnings`
+
+For the current verified build/run status and known issues, defer to `BUILD.md`.
 
 ## Known Issues And TODOs
 
@@ -87,10 +89,11 @@ recorded snapshots to SQLite for replay in the UI.
 
 ## Build And Test Commands
 
+Use `BUILD.md` as the source of truth for current verified commands. The core
+quality checks remain:
+
 ```bash
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-cd examples/demo-server && cargo run
-cargo run -p tracescope-app
 ```
