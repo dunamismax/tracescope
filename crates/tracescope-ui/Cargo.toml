@@ -11,7 +11,7 @@ eframe.workspace = true
 egui.workspace = true
 egui_extras.workspace = true
 serde.workspace = true
-tracescope-core = { path = "../tracescope-core" }
+tracescope-core = { version = "0.1.0", path = "../tracescope-core" }
 
 [dev-dependencies]
 tempfile.workspace = true
