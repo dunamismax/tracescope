@@ -1,522 +1,462 @@
-# TraceScope Build And Handoff
-
-This is the primary operational handoff document for this repository.
-
-This file is a **living document**. Every future agent or developer working in this repo is responsible for keeping it accurate, current, and up to date. If behavior, commands, tooling, risks, or repo structure change, update this file in the same pass.
-
-If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until the others are reconciled.
-
-Reviewed on: 2026-03-20
-Reviewed from commit: `c689af0730e8166d59b3dec0600fb964c321c859` plus working-tree updates applied during this pass
-Review environment used for verification: macOS, `zsh`, repo root `/Users/sawyer/github/tracescope`, `rustc 1.94.0`, `cargo 1.94.0`
-
-## 1. Project Baseline
-
-### What the application currently does
-
-TraceScope is a Rust workspace for a native desktop async telemetry viewer:
-
-- It connects to Tokio `console-subscriber` gRPC endpoints using `console-api`.
-- It maintains live in-memory snapshots of tasks, spans, resources, and derived warnings.
-- It can persist the current snapshot to SQLite and later reload it into the UI.
-- It ships with a demo Tokio server for local telemetry generation.
-
-### Major components, services, modules, and entry points
-
-- Workspace root: `Cargo.toml`
-  - Declares the four workspace members and shared dependency versions.
-  - Pins `rust-version = "1.81"`.
-- Workspace Cargo config: `.cargo/config.toml`
-  - Injects `--cfg tokio_unstable` for all cargo builds in this repo.
-- Desktop binary: `crates/tracescope-app/src/main.rs`
-  - CLI entry point.
-  - Creates the `eframe` app.
-  - Spawns a background Tokio runtime thread.
-  - Bridges UI and collector with `std::sync::mpsc`.
-- Core library: `crates/tracescope-core/src/lib.rs`
-  - `model.rs`: canonical domain types for tasks, spans, resources, sessions, warnings.
-  - `collector.rs`: gRPC collector for `Instrument` and `Trace` streams.
-  - `query.rs`: sorting and filtering helpers used by the UI.
-  - `store.rs`: SQLite persistence for saved sessions.
-- UI library: `crates/tracescope-ui/src/app.rs`
-  - Owns navigation, view state, recording controls, and session load/delete actions.
-  - Views live under `crates/tracescope-ui/src/views/`.
-- Demo target: `examples/demo-server/src/main.rs`
-  - Starts a Tokio application instrumented with `console_subscriber::init()`.
-  - Emits producer/consumer/mutex/timer activity for manual testing.
-- CI workflow: `.github/workflows/ci.yml`
-  - Runs the verified Rust quality gates on `ubuntu-latest`.
-  - Runs workspace build smoke tests on `macos-latest` and `windows-latest`.
-
-### Current implemented state
-
-Implemented and visible in code:
-
-- Connection screen with target input and connect/disconnect buttons.
-- Task table with filtering and sortable columns.
-- Resource table with filtering and sortable columns.
-- Warning table derived from task stats.
-- Simplified timeline view that renders span duration bars only.
-- Session recording, listing, loading, and deletion backed by SQLite.
-- Session persistence now uses a shared SQLite connection, enables WAL mode, and applies automatic schema migrations on open.
-- GitHub Actions CI for formatting, build, lint, test, nextest, deny, and cross-platform build smoke tests.
-- Collector support for:
-  - `Instrument.watch_updates()` task/resource updates.
-  - `Trace.watch()` span activity when the server supports it.
-  - Fallback behavior when the trace stream is unimplemented.
-
-Not implemented yet:
-
-- Session comparison and diffing.
-- Full replay/time-travel playback.
-- Full swimlane timeline with zoom/pan.
-- Heatmaps, flamegraphs, resource dependency graphs, OpenTelemetry import.
-
-Operational reality: current recording saves the latest snapshot at stop time, not an event log suitable for full replay.
-
-## 2. Verified Build And Run Workflow
-
-### Prerequisites
-
-Verified or directly confirmed from the repo:
-
-- Manifest declares `edition = "2021"` and `rust-version = "1.81"`.
-- Verified commands in this review pass ran with `rustc 1.94.0` and `cargo 1.94.0`.
-- No Node, Python, Docker, or database service is required for the current workspace.
-- SQLite is bundled via `rusqlite` feature `bundled`, so no system SQLite setup was required during review.
-
-Likely platform requirements, not fully verified here:
-
-- Desktop GUI support suitable for `eframe`/`wgpu`.
-- On Linux, X11/Wayland runtime/dev packages are likely needed because the manifest enables `x11` and `wayland` features.
-- The GitHub Actions Ubuntu job installs `pkg-config`, ALSA, `udev`, X11, EGL/GL, `xkbcommon`, and Wayland development packages before building.
-
-### Environment and configuration
-
-- Default data directory: `~/.tracescope`
-- Default SQLite database path: `~/.tracescope/sessions.db`
-- CLI flags:
-  - `--target <TARGET>` defaults to `127.0.0.1:6669` and is normalized to `http://...`
-  - `--data-dir <DATA_DIR>` overrides the persistence directory
-- Workspace cargo config:
-  - `.cargo/config.toml` sets `rustflags = ["--cfg", "tokio_unstable"]`
-  - This makes both `cargo run -p demo-server` and `cd examples/demo-server && cargo run` work without extra shell setup
-- Optional logging:
-  - `tracing_subscriber` honors `RUST_LOG`
-  - Fallback filter in code is `info,tracescope_core=debug,tracescope_app=debug`
-
-### Verified commands
-
-These commands were run successfully during this review unless marked as a verified failure.
-
-| Command | Result | Notes |
-| --- | --- | --- |
-| `cargo metadata --format-version 1 --no-deps` | Success | Confirms a 4-package workspace. |
-| `cargo fmt --all -- --check` | Success | Formatting is clean. |
-| `cargo build --workspace` | Success | All workspace members build. |
-| `cargo test --workspace` | Success | 14 tests pass, including the new store migration-preservation test in `tracescope-core`. |
-| `cargo nextest run --workspace` | Success | Uses `.config/nextest.toml`; 14 tests pass under nextest. |
-| `cargo bench -p tracescope-core --bench hot_paths --no-run` | Success | Criterion bench target compiles cleanly. |
-| `cargo bench -p tracescope-core --bench hot_paths -- --sample-size 10` | Success | Smoke-ran snapshot import/query benches; save ~8.6-13.0 ms, load ~3.2-4.9 ms, task query ~264-357 us, resource query ~68-133 us. |
-| `cargo deny check` | Success | `deny.toml` passes with duplicate-version warnings left at `warn`. |
-| `cargo clippy --workspace --all-targets -- -D warnings` | Success | No warnings under current code. |
-| `cargo run -p tracescope-app -- --help` | Success | CLI parsing works and prints options. |
-| `cargo run -p demo-server` | Success | Process stayed running from the workspace root; no `tokio_unstable` panic. |
-| `cd examples/demo-server && cargo run` | Success | Process stayed running after startup. |
-| `cargo run -p tracescope-app` | Success | Desktop window launch smoke-tested on reviewed macOS machine; no `wgpu` backend panic. |
-| `cargo run -p tracescope-app -- --target http://127.0.0.1:6669` | Success | Launch smoke test stayed running against the default demo target. |
-
-### Exact commands to use now
-
-Recommended safe workflow from the current repo state:
-
-```bash
-cargo fmt --all -- --check
-cargo build --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo nextest run --workspace
-cargo deny check
-```
-
-### CI workflow now present
-
-The repository now includes GitHub Actions CI at `.github/workflows/ci.yml`.
-
-- Triggers:
-  - pull requests
-  - pushes to `main`
-  - manual `workflow_dispatch`
-- `checks` job on `ubuntu-latest` runs:
-  - `cargo fmt --all -- --check`
-  - `cargo build --workspace --locked`
-  - `cargo clippy --workspace --all-targets --locked -- -D warnings`
-  - `cargo test --workspace --locked`
-  - `cargo nextest run --workspace --locked`
-  - `cargo deny check`
-- `desktop-builds` matrix runs `cargo build --workspace --locked` on:
-  - `macos-latest`
-  - `windows-latest`
-
-Operational note: this CI workflow was reviewed locally for correctness and aligned with the passing command set above, but it was not executed on GitHub from this review environment.
-
-Run the core hot-path benchmarks:
-
-```bash
-cargo bench -p tracescope-core --bench hot_paths
-```
-
-Run the demo server from the repository root:
-
-```bash
-cargo run -p demo-server
-```
-
-The example-directory command works too:
-
-```bash
-cd examples/demo-server
-cargo run
-```
-
-Launch the desktop app:
-
-```bash
-cargo run -p tracescope-app -- --target http://127.0.0.1:6669
-```
-
-Inspect the app CLI without launching the GUI:
-
-```bash
-cargo run -p tracescope-app -- --help
-```
-
-### Unverified but likely workflows
-
-These were not fully verified end-to-end in this pass:
-
-- `cargo run -p tracescope-app -- --data-dir /custom/path`
-  - CLI flag exists; not manually validated beyond launch behavior.
-- End-to-end interactive flow:
-  - start demo server
-  - launch app
-  - connect
-  - start recording
-  - stop recording
-  - load/delete a saved session
-  - verify resulting SQLite contents
-
-There are no repo-provided commands for:
-
-- database migrations beyond automatic store-open migrations
-- seeding
-- packaging/release builds
-- Docker-based local development
-
-## 3. Source-Of-Truth Notes
-
-### Files that should be treated as authoritative
-
-- `BUILD.md`
-  - Primary operational handoff document.
-- `Cargo.toml`
-  - Workspace membership, Rust version, dependency versions, and UI feature flags.
-- `.cargo/config.toml`
-  - Canonical place where repo-wide `tokio_unstable` is configured.
-- `Cargo.lock`
-  - Exact dependency resolution currently used by the repo.
-- `.config/nextest.toml`
-  - Canonical `cargo nextest` profile settings for this repo.
-- `deny.toml`
-  - Canonical `cargo-deny` policy, including current advisory ignore and license allowlist.
-- `.github/workflows/ci.yml`
-  - Canonical CI workflow for pull requests and `main` branch pushes.
-- `crates/tracescope-core/src/model.rs`
-  - Canonical schema for persisted and UI-rendered domain objects.
-- `crates/tracescope-core/src/store.rs`
-  - Canonical SQLite schema and persistence behavior.
-- `crates/tracescope-core/src/collector.rs`
-  - Canonical description of what live telemetry is actually collected and how warnings/states are derived.
-- `crates/tracescope-core/benches/hot_paths.rs`
-  - Canonical Criterion coverage for snapshot import/query hot paths.
-- `crates/tracescope-ui/src/app.rs`
-  - Canonical description of what user actions the UI currently supports.
-
-### Documentation quality and conflicts
-
-- `README.md` and `AGENTS.md` were reconciled in this pass to match current behavior.
-- `.github/workflows/ci.yml` was added in this pass and the docs were updated to describe it consistently.
-- `BUILD.md` still remains the operational source of truth because it tracks verified commands, gaps, and next-pass work in more detail than the shorter docs.
-
-### Important configuration details
-
-- `Cargo.toml`
-  - `eframe = { default-features = false, features = ["default_fonts", "wayland", "wgpu", "x11"] }`
-  - Workspace dev tooling now pins `criterion = "0.5.1"` and `proptest = "1.6.0"` through shared workspace dependencies.
-  - The app crate now also depends directly on `wgpu` with native backend features enabled (`dx12`, `gles`, `metal`, `vulkan`, `wgsl`) so the reviewed macOS launch path has a usable backend.
-- `.cargo/config.toml`
-  - Applies `tokio_unstable` repo-wide, removing the working-directory trap for the demo server.
-- `.config/nextest.toml`
-  - Defines the default nextest profile with a 30-second slow-test timeout and two-term slow termination threshold.
-- `deny.toml`
-  - Enforces `cargo-deny` across advisories, licenses, bans, and sources.
-  - Current policy explicitly ignores `RUSTSEC-2024-0436` because it is transitive through `wgpu`/`metal` in the chosen UI stack.
-  - Current bans policy leaves duplicate-version findings at `warn`, so `cargo deny check` succeeds but still prints duplicate dependency warnings.
-- `.github/workflows/ci.yml`
-  - Uses `stable` Rust in GitHub Actions rather than a separately verified MSRV toolchain job.
-  - Runs the full quality suite on Ubuntu and build smoke tests on macOS/Windows.
-- `crates/tracescope-app/src/main.rs`
-  - Defaults persistence to `~/.tracescope`
-  - Defaults the connection target to `127.0.0.1:6669`
-- `crates/tracescope-core/src/store.rs`
-  - Opens a shared SQLite connection for the app process.
-  - Configures `foreign_keys = ON`, `journal_mode = WAL`, and `synchronous = NORMAL`.
-  - Applies versioned SQLite migrations automatically via `PRAGMA user_version`.
-  - Persists full recorded snapshots transactionally via `save_session_snapshot`.
-- `crates/tracescope-core/src/collector.rs`
-  - `CloseSpan` now updates `exited_at` to the final close timestamp instead of preserving an earlier exit.
-
-## 4. Current Gaps And Known Issues
-
-### Verified remaining issues
-
-1. The full interactive manual loop is still not verified end-to-end.
-   - App launch was smoke-tested successfully.
-   - Demo-server launch was verified successfully.
-   - Connect, record, save, reload, and delete were not driven through the GUI in this pass.
-
-2. Recording is still snapshot-based, not event-log-based.
-   - `SessionStore::save_session_snapshot` now saves the latest task/span/resource state transactionally at stop time.
-   - There is no time-travel replay engine yet.
-
-### Codebase/product gaps visible in code
-
-- Timeline is Phase-1 only.
-  - Current UI renders proportional span bars without swimlanes, zoom, pan, or trace navigation.
-- Session comparison/diffing is absent.
-- UI integration tests are absent.
-  - Automated coverage is stronger in `tracescope-core` now, including query helpers, collector invariants, persistence, and Criterion hot-path benches.
-- The migration framework is still early-stage.
-  - Current migrations cover the baseline schema plus read/query indexes.
-  - Rollback/downgrade behavior is not implemented.
-- CI currently validates on stable/latest Rust only; there is no dedicated MSRV (`1.81`) GitHub Actions job yet.
-
-### Risk areas
-
-- Cross-platform desktop launch behavior needs broader validation on Linux and Windows even though the reviewed macOS launch path is fixed.
-- Repo-wide `tokio_unstable` is convenient for local development, but it is still a global build setting that should be kept in mind if new crates are added later.
-- Schema evolution now has a forward migration path, but downgrade handling and compatibility across multiple historical versions are still untested.
-
-## 5. Code Review Findings
-
-Full source review performed on 2026-03-20 against current working tree. Clippy passes clean, `cargo test` 14/14, `cargo nextest` 14/14, `cargo deny check` passes, and `cargo fmt --check` is clean.
-
-Items fixed in this pass:
-
-- `SessionStore` now keeps a shared SQLite `Connection` instead of opening a fresh connection per operation.
-- SQLite initialization now applies explicit schema versions and automatic migrations using `PRAGMA user_version`.
-- Store initialization now enables `WAL` mode and creates read/query indexes for sessions, tasks, spans, and resources.
-- Store tests now verify that opening a legacy unversioned `sessions.db` migrates it in place without losing persisted rows.
-- `normalize_target` is now owned by `tracescope-core` and reused by the app.
-- `load_session` now queries the requested session row directly instead of scanning `list_sessions()`.
-- Session payload loading now uses fixed allowlisted SQL statements instead of interpolated table/column names.
-- `timestamp_to_datetime` now validates protobuf nanoseconds with `u32::try_from`.
-- Recording persistence is now transactional across the session/tasks/spans/resources writes.
-- `CloseSpan` now cleans up `active_spans` and accounts for any final busy duration on close.
-- `CloseSpan` now also records the final close timestamp in `exited_at` so re-entered spans don't keep stale exit times.
-- UI cleanup landed for session-filter empty states, warning labels, timeline span labels, and enum text rendering.
-- The demo server now drops the original `tx` sender after spawning workers.
-- Query helper unit tests now cover task/resource/session filtering and ordering.
-- Collector property tests now cover task duration partitioning, span busy-time aggregation, and resource poll accounting invariants.
-- Criterion benches now cover snapshot save/load plus task/resource query hot paths in `tracescope-core`.
-- Workspace docs and config now include `cargo nextest` and `cargo-deny`.
-
-### Severity: Medium
-
-No medium-severity findings remain from this pass.
-
-### Severity: Low
-
-1. **`FieldValue::as_display` allocates a new `String` for every call** (`model.rs`)
-   - Returns `String` even for the `Debug` and `String` variants where a `&str` borrow would suffice. Called in the hot filter path (`query.rs:101`). Consider returning `Cow<'_, str>` or `&str` if filtering performance matters later.
-
-2. **`query_tasks` and `query_resources` clone all matching items** (`query.rs`)
-   - Every frame recomputes the filtered/sorted list by cloning all matching tasks and resources. At current data volumes this is fine. If task counts grow to thousands, consider caching the sorted result and invalidating on snapshot change.
-
-3. **100ms repaint timer** (`app.rs`)
-   - `ctx.request_repaint_after(Duration::from_millis(100))` runs at ~10 FPS equivalent. This is reasonable for a data viewer but means the UI will not reflect new data faster than 100ms even if the collector emits faster.
-
-### Severity: Informational (architecture notes)
-
-4. **Recording remains snapshot-only** (`app.rs`, `store.rs`)
-   - Recording still only tracks start time plus the final snapshot written at stop time. The transactional write fixed partial-session persistence, but it did not change the underlying snapshot-only data model.
-
-5. **Collector and UI integration coverage is still absent.**
-   - Automated coverage remains concentrated in `tracescope-core`. The highest-risk flows still need tests around collector state transitions and session interactions.
-
-### Code Review Addendum (2026-03-20, independent follow-up review)
-
-Local re-checks for this addendum passed:
-
+# TraceScope Build Manual
+
+Last updated: 2026-03-21
+Status: active stabilization and execution manual
+Scope: native Rust desktop viewer for Tokio `console-subscriber` telemetry, with SQLite-backed saved sessions
+Primary UI: desktop app via `eframe`/`egui` on `wgpu`
+Primary delivery order: trustworthy live connect/record/load/delete loop first, then event-aware recording and richer analysis surfaces
+
+## Purpose
+
+This file is the canonical execution and tracking document for TraceScope.
+Any agent or developer making substantial changes to code, docs, tooling, persistence, or product semantics should read it first and update it before handoff.
+If `BUILD.md`, `README.md`, and `AGENTS.md` disagree, treat `BUILD.md` as the operational source of truth until they are reconciled.
+
+## Mission
+
+- Make TraceScope a credible native desktop viewer for live Tokio console telemetry.
+- Keep the live collector path, saved-session path, and UI semantics honest about what the product actually records today.
+- Preserve a clean Rust workspace where `tracescope-core` owns domain truth, `tracescope-ui` owns presentation, and `tracescope-app` stays mostly wiring.
+- Keep the demo server usable as the easiest local verification target for contributors.
+- Make future work legible for multiple agentic contributors without hidden assumptions or roadmap fiction.
+
+## Current Repository Snapshot
+
+### Active root
+
+- `BUILD.md` is the canonical plan, handoff, and progress ledger.
+- `README.md` is the public-facing status summary.
+- `AGENTS.md` is the compact contributor-orientation note that points back here.
+- `Cargo.toml` and `Cargo.lock` define the active Rust workspace and exact dependency graph.
+- `.cargo/config.toml` is an active repo-wide runtime/tooling input because it injects `--cfg tokio_unstable`.
+- `.config/nextest.toml` is the active `cargo nextest` profile.
+- `deny.toml` is the active `cargo-deny` policy.
+- `.github/workflows/ci.yml` is the active CI definition.
+- `crates/` contains the active product crates.
+- `examples/demo-server/` contains the active local telemetry generator used for manual testing.
+
+### Active workspace members
+
+- `crates/tracescope-core`
+  - Canonical domain model.
+  - gRPC collector.
+  - Query helpers.
+  - SQLite persistence and migrations.
+- `crates/tracescope-ui`
+  - `eframe`/`egui` application state.
+  - Navigation and view logic.
+  - Session controls and view rendering.
+- `crates/tracescope-app`
+  - Binary entrypoint and CLI.
+  - Native window setup.
+  - Collector-manager thread and runtime wiring.
+- `examples/demo-server`
+  - Tokio console demo workload for local manual verification.
+
+### Implemented and visible today
+
+- Connection screen with connect and disconnect controls.
+- Live task table with sorting and filtering.
+- Live resource table with sorting and filtering.
+- Warning view derived from task state.
+- Simplified span timeline with proportional duration bars.
+- Session recording controls that save the current snapshot to SQLite.
+- Session listing, loading, and deletion from the desktop UI.
+- Shared SQLite connection, WAL mode, foreign keys, and automatic schema migrations.
+- Collector support for both `Instrument.watch_updates()` and `Trace.watch()` when the target supports them.
+- Fallback behavior when the trace stream is unavailable or unimplemented.
+- Focused `tracescope-ui` app-state tests in addition to the stronger existing `tracescope-core` test coverage.
+- GitHub Actions CI for fmt, build, clippy, test, nextest, deny, and cross-platform build smoke tests.
+
+### Honest limits today
+
+- Recording is still snapshot-based, not event-log-based.
+- Replay is still limited to loading a saved snapshot back into the UI.
+- Full manual verification of connect -> record -> stop -> load -> delete is still not documented as re-run end to end after the latest fixes.
+- The timeline is still an early slice: no swimlanes, zoom, pan, or deep trace navigation.
+- Session comparison and diffing are still absent.
+- `tracescope-app` and `examples/demo-server` still have no automated tests.
+- The collector-to-UI transport still pushes full cloned snapshots over an unbounded channel, which is the most obvious current scaling risk.
+
+### Current technical baseline
+
+- Rust edition: `2021`
+- Declared `rust-version`: `1.81`
+- Desktop stack: `eframe`, `egui`, `wgpu`
+- Telemetry stack: `tokio`, `tonic`, `console-api`, `console-subscriber`
+- Persistence stack: bundled `rusqlite`
+- Dev/quality tooling present in-repo: `cargo fmt`, `clippy`, `cargo nextest`, `cargo-deny`, `criterion`, `proptest`
+- Global repo build assumption: `.cargo/config.toml` injects `--cfg tokio_unstable`
+
+### Currently verified commands
+
+These commands are already documented as having run successfully in this repository's recorded review history unless otherwise noted.
+
+- `cargo metadata --format-version 1 --no-deps`
 - `cargo fmt --all -- --check`
-- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo build --workspace`
 - `cargo test --workspace`
 - `cargo nextest run --workspace`
-- `cargo deny check` (still reports duplicate-version warnings, but policy is intentionally `warn`)
-
-Strengths confirmed in the current codebase:
-
-- The crate split is clean and sensible: `tracescope-core` holds the model/collector/store logic, `tracescope-ui` is mostly presentation, and `tracescope-app` is thin wiring.
-- Persistence is in a materially better place than a typical early-stage desktop tool: WAL mode, foreign keys, transactional snapshot saves, and explicit schema migrations are all in place.
-- Repo hygiene is solid for a work-in-progress desktop app: CI runs fmt/build/clippy/test/nextest/deny on Ubuntu and cross-platform build smoke tests on macOS/Windows.
-- Documentation quality is high. `BUILD.md` and `README.md` accurately describe the current product shape and known limits.
-
-Additional findings from this review:
-
-### Severity: Medium
-
-1. **"Recording" is not gated on a live connection and can silently re-save stale or replayed data** (`crates/tracescope-ui/src/app.rs`)
-   - `start_recording()` only captures a timestamp, and `stop_recording()` always persists the current in-memory snapshot.
-   - There is no check that the app is currently connected, receiving live telemetry, or not browsing a previously loaded session.
-   - In practice, a user can hit record while disconnected or while viewing a loaded session and create a new saved session that is just a copy of old data. That is a product-semantics bug, not just a missing feature.
-
-2. **The collector ships full cloned snapshots over an unbounded channel on every update event** (`crates/tracescope-app/src/main.rs`, `crates/tracescope-core/src/collector.rs`, `crates/tracescope-ui/src/app.rs`)
-   - The app uses `std::sync::mpsc::channel()`, which is unbounded.
-   - The collector calls `state.snapshot()` after each instrument update and each trace event, cloning all tasks, spans, resources, and warnings every time.
-   - On noisy targets, this can turn into avoidable allocation churn and queue growth if the UI falls behind. Architecturally, this is the biggest scale risk currently visible in the code.
-
-### Severity: Low
-
-3. **Placeholder spans are only partially hydrated if an enter event is seen before full span registration** (`crates/tracescope-core/src/collector.rs`)
-   - `EnterSpan` creates a fallback span with `name = span-<id>`, `target = "unknown"`, and a default level.
-   - Later `register_span()` updates fields and `entered_at`, but it does not backfill `name`, `target`, or `level` for an already-created placeholder.
-   - If event ordering ever produces enter-before-register, the UI can keep degraded span metadata indefinitely.
-
-4. **`updated_at` reflects instrument updates, not trace-only activity** (`crates/tracescope-core/src/collector.rs`)
-   - `updated_at` is advanced in `apply_update()` from `Update.now`, but `apply_trace_event()` does not update it.
-   - If the trace stream is active while task/resource updates are quiet, the connection view's "Last update" timestamp can lag behind actual incoming span activity.
-
-### Coverage / maintenance notes
-
-5. **The highest-risk user flows still have no automated coverage**
-   - `tracescope-app`, `tracescope-ui`, and `examples/demo-server` still have zero tests.
-   - CI proves the desktop code compiles on macOS/Windows, but it does not exercise a launch smoke test or any connect/record/load/delete interaction.
-   - Given the amount of behavior living in `TraceScopeApp`, this is now the main quality-gap after the core-store work.
-
-Recommended next steps from this addendum:
-
-1. Gate recording behind a live connection, or rename the action so snapshot export and live recording are clearly distinct.
-2. Replace the unbounded full-snapshot push model with either a bounded/coalescing channel or a shared-state pull model from the UI.
-3. Add regression coverage for app-level session behavior and for the collector's span-registration ordering edge case.
-4. Add at least one desktop startup smoke test path beyond compile-only CI, even if it remains lightweight.
-
-### Implementation Follow-Up (2026-03-20, recording gate and span hydration)
-
-Changed in this pass:
-
-- `tracescope-ui` now gates recording on a live collector connection, surfaces the blocked reason in the sessions view and status bar, prevents loading/deleting sessions mid-recording, and cancels an active recording if the live connection drops.
-- `tracescope-core` now hydrates placeholder spans when later span registration metadata arrives, tracks span metadata IDs so late metadata batches can backfill existing spans, and advances `updated_at` from trace-only span activity.
-- Added focused regression coverage in `tracescope-ui` for disconnected/session-loaded recording behavior and in `tracescope-core` for late span registration and trace-driven `updated_at`.
-
-Verified in this pass:
-
-- `cargo fmt --all -- --check`
+- `cargo bench -p tracescope-core --bench hot_paths --no-run`
+- `cargo bench -p tracescope-core --bench hot_paths -- --sample-size 10`
+- `cargo deny check`
+- `cargo clippy --workspace --all-targets -- -D warnings`
+- `cargo run -p tracescope-app -- --help`
+- `cargo run -p demo-server`
+- `cd examples/demo-server && cargo run`
+- `cargo run -p tracescope-app`
+- `cargo run -p tracescope-app -- --target http://127.0.0.1:6669`
 - `cargo test -p tracescope-core -p tracescope-ui`
 - `cargo clippy -p tracescope-core -p tracescope-ui --all-targets -- -D warnings`
 
-Still remaining:
+## Working Principles
 
-- Recording is still snapshot-based rather than an event log.
-- Session browsing still lacks end-to-end UI smoke coverage.
-- The unbounded full-snapshot channel remains the main scaling risk called out in this review addendum.
+- Truth over roadmap polish.
+  Do not describe TraceScope as a replay tool, time-travel debugger, or comparison suite until those behaviors actually exist.
+- Core owns the product truth.
+  Collector semantics, domain models, query logic, and persistence rules belong in `tracescope-core`, not ad hoc UI helpers.
+- The app crate stays thin.
+  `tracescope-app` should assemble threads, runtime, CLI, and windowing; it should not become a second business-logic home.
+- Snapshot semantics must stay explicit.
+  Until an event log exists, session recording means "save the latest snapshot at stop time," not "capture a full historical timeline."
+- Persistence changes must be deliberate.
+  Schema changes, migration policy, and session compatibility need explicit notes in this file and matching updates in code/tests.
+- Demo-server usability matters.
+  The easiest manual loop should keep working from the repo root without shell trivia.
+- Verification is part of done.
+  If commands or flows were not run, say so plainly.
+- Documentation moves with behavior.
+  If launch behavior, quality gates, persistence semantics, or known gaps change, update this file in the same pass.
 
-## 6. Next-Pass Priorities
+## Source Of Truth By Concern
 
-### Highest impact, in dependency order
+- Operational status, phase tracking, verified-command history, known gaps:
+  - `BUILD.md`
+- Public project framing and quick-start story:
+  - `README.md`
+- Contributor orientation and repo entrypoint note:
+  - `AGENTS.md`
+- Workspace membership, dependency versions, desktop features, Rust version:
+  - `Cargo.toml`
+- Exact dependency resolution:
+  - `Cargo.lock`
+- Repo-wide `tokio_unstable` behavior:
+  - `.cargo/config.toml`
+- Nextest behavior:
+  - `.config/nextest.toml`
+- Dependency/advisory/license policy:
+  - `deny.toml`
+- CI behavior and branch/pull-request checks:
+  - `.github/workflows/ci.yml`
+- Canonical domain model and persisted object shapes:
+  - `crates/tracescope-core/src/model.rs`
+- Live telemetry collection, target normalization, snapshot assembly, trace-event handling:
+  - `crates/tracescope-core/src/collector.rs`
+- SQLite schema, migration policy, and session save/load/delete semantics:
+  - `crates/tracescope-core/src/store.rs`
+- Sorting and filtering semantics for tasks/resources/sessions:
+  - `crates/tracescope-core/src/query.rs`
+- Native app CLI, window launch path, collector-manager thread, and runtime wiring:
+  - `crates/tracescope-app/src/main.rs`
+- User-facing app state, recording rules, session interactions, and screen routing:
+  - `crates/tracescope-ui/src/app.rs`
+- Current view surfaces:
+  - `crates/tracescope-ui/src/views/`
+- Benchmarked hot paths:
+  - `crates/tracescope-core/benches/hot_paths.rs`
+- Manual telemetry source for local testing:
+  - `examples/demo-server/src/main.rs`
 
-1. Re-establish a real manual test loop.
-   - Demo server starts.
-   - App launches.
-   - App connects to `127.0.0.1:6669`.
-   - Recording saves to SQLite.
-   - Session load/delete works.
+## Current Architecture And Flow
 
-2. Add tests where current risk is highest.
-   - UI/session-flow tests if practical.
-   - A manual-or-automated persistence smoke test that exercises the app/store boundary.
-   - If practical, a small integration test for demo-server compatibility.
+### Crate boundaries
 
-3. Upgrade the recording model.
-   - Move from snapshot-only persistence toward an event-log or timeline-oriented session format.
-
-4. Exercise the migration framework with the first intentional schema evolution.
-   - Add at least one data-shape change beyond index creation.
-   - Decide whether downgrades, compatibility windows, or backup/repair flows are required.
-
-5. Add MSRV or release-oriented CI only if needed.
-   - The current workflow covers day-to-day quality checks and cross-platform build smoke tests, but it does not verify `rust-version = "1.81"` separately or produce release artifacts.
-
-### Deeper refactors
-
-- Replace snapshot-only recording with an event-log or timeline-oriented persistence model.
-- Extend the migration framework with future schema changes and compatibility policy.
-- Build the richer timeline/comparison features currently listed only as roadmap items.
-
-## 7. Next-Agent Checklist
-
-Use this in order after opening the repo:
-
-1. Read `BUILD.md` first.
-2. Read `Cargo.toml` to confirm workspace members and current dependency/features.
-3. Read `crates/tracescope-app/src/main.rs`, then `crates/tracescope-core/src/collector.rs`, then `crates/tracescope-core/src/store.rs`, then `crates/tracescope-ui/src/app.rs`.
-4. Run:
-
-```bash
-cargo fmt --all -- --check
-cargo build --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo nextest run --workspace
-cargo deny check
-```
-
-5. For demo-server work, use either of these exact commands:
-
-```bash
-cargo run -p demo-server
-```
-
-or
-
-```bash
-cd examples/demo-server && cargo run
-```
-
-6. Re-test `cargo run -p tracescope-app` after any dependency or windowing change. It is working on the reviewed macOS environment now, but this remains a sensitive path.
-7. If your goal is UI feature work, re-run the manual loop early so you do not stack changes on top of an unverified app path.
-8. If you change persistence, update both:
-   - `crates/tracescope-core/src/model.rs`
-   - `crates/tracescope-core/src/store.rs`
-9. If you change commands, launch behavior, or known issues, update this file in the same commit.
-10. Review section 5 (Code Review Findings) for known issues before making changes in the affected areas.
-
-## Appendix: Current Test Inventory
-
-Verified current automated coverage:
-
-- GitHub Actions CI:
-  - `ubuntu-latest`: `fmt`, `build`, `clippy`, `test`, `nextest`, and `deny`
-  - `macos-latest` and `windows-latest`: `cargo build --workspace --locked`
 - `tracescope-core`
-  - duration arithmetic test
-  - warning derivation test
-  - SQLite session round-trip test
-  - batch replacement persistence test
-  - delete cascade persistence test
-  - legacy unversioned database migration-preservation test
-- `tracescope-app`
-  - no tests
+  - Owns tasks, spans, resources, warnings, sessions, and query helpers.
+  - Owns the gRPC collector and `CollectorSnapshot` shape.
+  - Owns persistence and SQLite migrations.
 - `tracescope-ui`
-  - no tests
-- `examples/demo-server`
-  - no tests
+  - Owns `TraceScopeApp` state, navigation, view switching, and recording/session commands.
+  - Renders connection, tasks, timeline, resources, sessions, and warnings views.
+- `tracescope-app`
+  - Parses CLI flags.
+  - Chooses the data directory.
+  - Launches the native `eframe` window.
+  - Spawns a collector-manager thread with a Tokio runtime.
+- `demo-server`
+  - Emits Tokio-console telemetry for manual testing.
+
+### Runtime data flow
+
+1. The CLI chooses a target address and optional data directory.
+2. `tracescope-app` normalizes the target and opens the desktop window.
+3. The app thread and collector-manager thread communicate over `std::sync::mpsc` channels.
+4. The collector manager spins up a Tokio runtime and runs `Collector`.
+5. `Collector` consumes `Instrument.watch_updates()` and, when available, `Trace.watch()`.
+6. Collector state builds an in-memory snapshot of tasks, spans, resources, warnings, connection state, and timestamps.
+7. Full `CollectorSnapshot` values are sent back to the UI.
+8. `tracescope-ui` updates app state, derives filtered/sorted task and resource views through `tracescope-core::query`, and renders the active screen.
+9. When recording stops, the UI asks `SessionStore` to save the current snapshot transactionally into SQLite.
+10. When a saved session is loaded, the UI reconstructs a disconnected read-only snapshot for inspection.
+
+### Architectural realities to keep in mind
+
+- The current transport is simple but heavy: full cloned snapshots on an unbounded channel.
+- Loaded sessions are intentionally disconnected snapshots, not replay streams.
+- The timeline view is currently a visualization of saved/live span state, not a full navigation model over historical events.
+- `tracescope-core` is already the right home for semantics that might otherwise drift between the collector and UI.
+
+## How Contributors Must Work
+
+1. Read `BUILD.md` first, then the source-of-truth files for the area you are touching.
+2. Keep `tracescope-core` as the canonical home for model, query, collector, and persistence behavior.
+3. Keep `tracescope-app` thin; do not hide product semantics in the binary crate.
+4. If you change persistence, review and update both `model.rs` and `store.rs`, plus the relevant tests.
+5. If you change recording behavior, make the snapshot-vs-event-log story explicit here.
+6. If you change commands, launch behavior, or quality gates, update this file in the same pass.
+7. Do not mark a phase item complete unless the code or documentation artifact actually exists.
+8. Record commands that were actually run; do not promote intended checks into verified history.
+9. If a change reveals uncertainty, add it to the open-decisions section instead of letting it stay implicit.
+10. Prefer targeted tests and the narrowest useful verification first, then broaden when the change justifies it.
+
+## Tracking Conventions
+
+- Each phase has a `Status:` line.
+  Use `not started`, `in progress`, `done`, or `blocked`.
+- Checkboxes track concrete deliverables.
+  Only check a box when the repository or this document already reflects it.
+- The progress log is append-only.
+  Do not rewrite old verification history into something tidier.
+- The decision log records durable product or architecture choices.
+- If scope changes, update the relevant phase before or alongside the code.
+
+### Progress log format
+
+- `YYYY-MM-DD: scope - outcome. Verified with: <commands or audit>. Next: <follow-up>.`
+
+### Decision log format
+
+- `YYYY-MM-DD: decision - rationale - consequence.`
+
+## Quality Gates
+
+### Current minimum gate for meaningful code changes
+
+- `cargo fmt --all -- --check`
+- `cargo build --workspace`
+- `cargo test --workspace`
+
+### Current fuller gate wired in CI and aligned with the locally verified command set
+
+- `cargo fmt --all -- --check`
+- `cargo build --workspace --locked`
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`
+- `cargo test --workspace --locked`
+- `cargo nextest run --workspace --locked`
+- `cargo deny check`
+
+### Situational gates
+
+- For hot-path or scaling work:
+  - `cargo bench -p tracescope-core --bench hot_paths`
+- For app launch or windowing changes:
+  - `cargo run -p tracescope-app`
+  - `cargo run -p tracescope-app -- --target http://127.0.0.1:6669`
+- For demo-server changes:
+  - `cargo run -p demo-server`
+  - or `cd examples/demo-server && cargo run`
+
+If a command was not run in the current pass, say so.
+
+## Phase Dashboard
+
+- Phase 0 - Build manual, repo framing, and source-of-truth mapping. Status: done.
+- Phase 1 - Core live-telemetry desktop foundation. Status: done.
+- Phase 2 - Snapshot persistence and schema baseline. Status: done.
+- Phase 3 - Trustworthy daily-use live session workflow. Status: in progress.
+- Phase 4 - Event-aware recording and replay model. Status: not started.
+- Phase 5 - Richer analysis surfaces. Status: not started.
+- Phase 6 - Test and verification hardening. Status: in progress.
+- Phase 7 - Performance and transport hardening. Status: in progress.
+- Phase 8 - CI, release, and packaging discipline. Status: in progress.
+
+## Detailed Phase Plan
+
+### Phase 0 - Build manual, repo framing, and source-of-truth mapping
+
+Status: done
+
+- [x] Establish `BUILD.md` as the canonical operational handoff document.
+- [x] Map the active root files, workspace members, and authoritative files by concern.
+- [x] Document the current verified command set and the current honest gaps.
+- [x] Keep `README.md` and `AGENTS.md` aligned closely enough that they can safely point back here.
+
+Exit criteria:
+
+- [x] A new contributor can tell what the repo is, how it is built, what is real, and what is still missing.
+
+### Phase 1 - Core live-telemetry desktop foundation
+
+Status: done
+
+- [x] Split the workspace into `tracescope-core`, `tracescope-ui`, `tracescope-app`, and `demo-server`.
+- [x] Implement the core task/span/resource/session/warning model.
+- [x] Implement collector support for `Instrument.watch_updates()`.
+- [x] Implement trace-stream support when available.
+- [x] Launch a native `eframe` desktop app that renders connection, task, timeline, resource, session, and warning views.
+- [x] Run the demo server from the repository root with repo-owned `tokio_unstable` settings.
+
+Exit criteria:
+
+- [x] TraceScope has a launchable desktop shell, a live collector path, and the core screens needed for live snapshot inspection.
+
+### Phase 2 - Snapshot persistence and schema baseline
+
+Status: done
+
+- [x] Persist saved sessions to SQLite.
+- [x] Keep SQLite bundled so local setup does not require a separate database install.
+- [x] Use a shared app-process connection instead of one connection per operation.
+- [x] Enable `foreign_keys = ON`, `journal_mode = WAL`, and `synchronous = NORMAL`.
+- [x] Apply automatic schema migrations through `PRAGMA user_version`.
+- [x] Save sessions transactionally through `save_session_snapshot`.
+- [x] Support listing, loading, and deleting saved sessions.
+
+Exit criteria:
+
+- [x] Session persistence is no longer a throwaway prototype and has a real migration baseline.
+
+### Phase 3 - Trustworthy daily-use live session workflow
+
+Status: in progress
+
+- [x] Normalize CLI targets so bare `host:port` input works.
+- [x] Gate recording on a live connection.
+- [x] Treat loaded sessions as read-only snapshots.
+- [x] Cancel an active recording if the live connection drops.
+- [x] Smoke-test desktop launch on the reviewed macOS machine.
+- [ ] Re-run and document a full manual loop of connect -> record -> stop -> load -> delete after the latest fixes.
+- [ ] Re-establish the same manual confidence on Linux and Windows, or document the current platform-specific gaps explicitly.
+- [ ] Tighten the user-facing semantics around what current "recording" means if the product keeps the snapshot-only model for a while longer.
+
+Exit criteria:
+
+- [ ] The basic live workflow is not just implemented in code but freshly verified and clearly explained.
+
+### Phase 4 - Event-aware recording and replay model
+
+Status: not started
+
+- [ ] Decide the long-term session format: event log, checkpoints plus deltas, or another explicit replay model.
+- [ ] Extend persistence beyond stop-time snapshot saves.
+- [ ] Define how replay/time-travel should work in the UI.
+- [ ] Decide whether snapshot export remains a separate feature alongside richer recording.
+- [ ] Document compatibility expectations for existing snapshot-only saved sessions.
+
+Exit criteria:
+
+- [ ] TraceScope can honestly claim something stronger than snapshot save/load without hand-waving.
+
+### Phase 5 - Richer analysis surfaces
+
+Status: not started
+
+- [ ] Evolve the timeline beyond proportional span bars into a more navigable analysis surface.
+- [ ] Add session comparison and diffing if it still fits the product direction after the recording model is upgraded.
+- [ ] Decide which future analysis surfaces are core scope versus backlog: replay navigation, richer trace inspection, dependency views, or imports.
+
+Exit criteria:
+
+- [ ] The product offers deeper analysis than the current tables-plus-basic-timeline baseline.
+
+### Phase 6 - Test and verification hardening
+
+Status: in progress
+
+- [x] Maintain core unit coverage in `tracescope-core`.
+- [x] Add property coverage for collector invariants with `proptest`.
+- [x] Add focused `tracescope-ui` regression tests for current recording/session rules.
+- [x] Add Criterion hot-path benches in `tracescope-core`.
+- [x] Wire `cargo nextest` and `cargo-deny` into the documented workflow.
+- [ ] Add tests for `tracescope-app`.
+- [ ] Add automated coverage for the highest-risk cross-crate flows: collector -> app -> UI -> store.
+- [ ] Add at least one lightweight desktop startup smoke path beyond compile-only validation.
+- [ ] Add demo-server compatibility coverage if practical.
+
+Exit criteria:
+
+- [ ] The highest-risk behavior no longer depends mostly on manual confidence.
+
+### Phase 7 - Performance and transport hardening
+
+Status: in progress
+
+- [x] Identify the current main scaling risk: full cloned snapshots over an unbounded channel.
+- [x] Benchmark snapshot save/load and task/resource query hot paths.
+- [ ] Replace or contain the unbounded full-snapshot push model.
+- [ ] Measure how the app behaves with noisy targets or larger task/resource counts.
+- [ ] Revisit repeated query cloning and display-path allocation only if measurements show they matter.
+- [ ] Keep any transport simplification aligned with the current crate boundary rather than pushing semantics into the UI.
+
+Exit criteria:
+
+- [ ] TraceScope has a measured plan for noisy live targets instead of relying on hope.
+
+### Phase 8 - CI, release, and packaging discipline
+
+Status: in progress
+
+- [x] Add GitHub Actions CI for fmt/build/clippy/test/nextest/deny on Ubuntu.
+- [x] Add cross-platform workspace build smoke tests on macOS and Windows.
+- [ ] Add a dedicated MSRV `1.81` job if the project intends to keep that promise actively.
+- [ ] Decide the first release/install story.
+- [ ] Add release-oriented artifact or packaging workflow once the product surface is ready.
+- [ ] Document cross-platform runtime expectations beyond compile-only smoke tests.
+
+Exit criteria:
+
+- [ ] The project has a release story, not just a developer workflow.
+
+## Open Decisions And Unresolved Scope
+
+- Should the current snapshot-at-stop-time feature keep the name "recording," or should the product split snapshot export from future event-based recording more explicitly?
+- What should replace the current unbounded full-snapshot collector -> UI transport: bounded queue, coalescing channel, shared-state pull, or another explicit design?
+- What backward-compatibility promise does TraceScope want for saved-session schema changes beyond forward migration on open?
+- How much Linux and Windows runtime validation is required before the desktop path is treated as equally trustworthy off the reviewed macOS machine?
+- Is MSRV `1.81` a real compatibility commitment that deserves CI, or just the current manifest floor?
+- What is the first release-worthy product bar: live viewer plus snapshot save/load, or a stronger replay/analysis story?
+
+## Risk Register
+
+- Full cloned snapshots over an unbounded channel can amplify allocation churn and queue growth on noisy targets.
+- Snapshot-only persistence can create user-expectation drift if the UI language sounds more like a historical recorder than it really is.
+- The most important user journey still lacks a freshly documented end-to-end manual verification loop.
+- Desktop launch and rendering behavior are still more confidently reviewed on macOS than on Linux or Windows.
+- Schema migration is now real, but downgrade policy and long-horizon compatibility are still unclear.
+- Repo-wide `tokio_unstable` simplifies local development but remains a global assumption that future crates must respect.
+- Automated coverage is still stronger in `tracescope-core` than across the full app/runtime/session stack.
+
+## Decision Log
+
+- 2026-03-20: `BUILD.md` is the operational source of truth when repo docs disagree - keeps active work anchored to the most detailed handoff surface - contributors should reconcile shorter docs to match it rather than guess.
+- 2026-03-20: The workspace keeps repo-wide `tokio_unstable` in `.cargo/config.toml` - avoids a working-directory trap for the demo server and other local runs - future workspace members inherit that assumption unless the repo structure changes.
+- 2026-03-20: The desktop product surface is `eframe`/`egui` on `wgpu`, with the app crate carrying a direct native-backend `wgpu` dependency - this fixed the reviewed macOS launch path cleanly - windowing/backend changes should be treated as sensitive.
+- 2026-03-20: Session persistence uses bundled SQLite with a shared connection, WAL mode, foreign keys, `synchronous = NORMAL`, and `PRAGMA user_version` migrations - gives the desktop app a credible local persistence baseline without external setup - schema changes now need migration discipline.
+- 2026-03-20: Saved sessions remain stop-time snapshot captures, not event logs - this keeps storage and UI complexity lower while the product is still stabilizing - replay and time-travel remain explicitly out of scope for the current implementation.
+- 2026-03-20: Recording is only allowed against a live connection, and loaded sessions are read-only - this prevents silently re-saving stale or replayed data as if it were live capture - session semantics are stricter even though the underlying persistence model is still snapshot-based.
+- 2026-03-20: CI runs fmt/build/clippy/test/nextest/deny on Ubuntu plus build smoke tests on macOS and Windows - this gives the repo a solid day-to-day quality floor - runtime behavior outside the reviewed macOS environment still needs more than compile-only confidence.
+
+## Immediate Next Moves
+
+1. Re-run and document the real manual loop: demo server up, app launch, connect, record, stop, load, and delete.
+2. Choose the next collector -> UI transport strategy and remove the current unbounded full-snapshot pressure path.
+3. Decide whether to keep calling the current feature "recording" while it is still snapshot-only, or start the event-log design that makes the name accurate.
+4. Add a lightweight automated smoke path for app/runtime/session behavior so the highest-risk flow is not purely manual.
+
+## Progress Log
+
+- 2026-03-20: Baseline repository review completed from commit `c689af0730e8166d59b3dec0600fb964c321c859` plus working-tree updates on macOS with `zsh`, `rustc 1.94.0`, and `cargo 1.94.0`; documented the active workspace shape, verified command set, and current build/run workflow. Verified with: `cargo metadata --format-version 1 --no-deps`, `cargo fmt --all -- --check`, `cargo build --workspace`, `cargo test --workspace`, `cargo nextest run --workspace`, `cargo bench -p tracescope-core --bench hot_paths --no-run`, `cargo bench -p tracescope-core --bench hot_paths -- --sample-size 10`, `cargo deny check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo run -p tracescope-app -- --help`, `cargo run -p demo-server`, `cd examples/demo-server && cargo run`, `cargo run -p tracescope-app`, `cargo run -p tracescope-app -- --target http://127.0.0.1:6669`. Next: harden persistence and follow up with an independent review.
+- 2026-03-20: Strengthened the persistence and tooling baseline with a shared SQLite connection, WAL mode, automatic migrations, indexed queries, transactional snapshot saves, safer session loading paths, better timestamp validation, late span-close cleanup, Criterion hot-path benches, repo-level nextest and deny config, and CI documentation. Verified with: the repository review command set above plus source audit of `store.rs`, `collector.rs`, `Cargo.toml`, `.cargo/config.toml`, `.config/nextest.toml`, `deny.toml`, and `.github/workflows/ci.yml`. Next: run an independent review pass to identify remaining semantic and scaling risks.
+- 2026-03-20: Independent follow-up review confirmed no medium-severity findings remained apart from product-semantics and scaling issues; the biggest remaining concerns were snapshot-style recording semantics and the unbounded full-snapshot channel. Verified with: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, `cargo nextest run --workspace`, `cargo deny check`. Next: gate recording on live state and add targeted regressions.
+- 2026-03-20: Tightened recording and trace-state behavior by blocking recording without a live connection, treating loaded sessions as read-only, cancelling recordings on disconnect, hydrating placeholder spans from late metadata, advancing `updated_at` from trace-only activity, and adding focused `tracescope-core` and `tracescope-ui` regression coverage. Verified with: `cargo fmt --all -- --check`, `cargo test -p tracescope-core -p tracescope-ui`, `cargo clippy -p tracescope-core -p tracescope-ui --all-targets -- -D warnings`. Next: re-establish the end-to-end manual loop and tackle the collector transport scaling risk.
+- 2026-03-21: Rewrote `BUILD.md` into a phase-based execution manual aligned with the current repository structure, source-of-truth mapping, architecture flow, quality gates, phase dashboard, open decisions, risks, and preserved verification history. Verified with: source audit of `BUILD.md`, `README.md`, `AGENTS.md`, `Cargo.toml`, `crates/tracescope-core/src/lib.rs`, `crates/tracescope-core/src/collector.rs`, `crates/tracescope-core/src/store.rs`, `crates/tracescope-app/src/main.rs`, and `crates/tracescope-ui/src/app.rs`. Next: execute and document the manual connect/record/load/delete loop.
